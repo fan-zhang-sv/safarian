@@ -1,0 +1,51 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="172" y1="92" x2="852" y2="932" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F8FBFF"/>
+      <stop offset="0.34" stop-color="#DFF1FF"/>
+      <stop offset="0.68" stop-color="#66B7EE"/>
+      <stop offset="1" stop-color="#1D6BC8"/>
+    </linearGradient>
+    <linearGradient id="aura" x1="300" y1="156" x2="726" y2="814" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#72E2C2"/>
+      <stop offset="0.55" stop-color="#4E9AF1"/>
+      <stop offset="1" stop-color="#2748A8"/>
+    </linearGradient>
+    <linearGradient id="needle" x1="414" y1="208" x2="610" y2="802" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.44" stop-color="#F5FAFF"/>
+      <stop offset="0.45" stop-color="#236DD4"/>
+      <stop offset="1" stop-color="#083E93"/>
+    </linearGradient>
+    <filter id="softShadow" x="106" y="113" width="812" height="822" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="30" stdDeviation="34" flood-color="#103B73" flood-opacity="0.22"/>
+    </filter>
+    <filter id="needleShadow" x="314" y="196" width="396" height="642" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="20" flood-color="#06366C" flood-opacity="0.28"/>
+    </filter>
+    <clipPath id="clip">
+      <rect x="92" y="92" width="840" height="840" rx="210"/>
+    </clipPath>
+  </defs>
+  <g filter="url(#softShadow)">
+    <rect x="92" y="92" width="840" height="840" rx="210" fill="url(#bg)"/>
+    <g clip-path="url(#clip)">
+      <circle cx="292" cy="231" r="304" fill="white" fill-opacity="0.46"/>
+      <circle cx="780" cy="800" r="354" fill="#0B3E9E" fill-opacity="0.2"/>
+      <path d="M166 724C282 568 439 487 640 482C759 480 850 447 924 377V932H166V724Z" fill="#77D9B8" fill-opacity="0.28"/>
+      <path d="M147 235C260 141 410 101 571 126C706 147 805 207 909 311" stroke="white" stroke-opacity="0.34" stroke-width="28" stroke-linecap="round"/>
+    </g>
+    <circle cx="512" cy="512" r="318" fill="white" fill-opacity="0.13"/>
+    <circle cx="512" cy="512" r="288" stroke="white" stroke-opacity="0.58" stroke-width="18"/>
+    <circle cx="512" cy="512" r="210" stroke="url(#aura)" stroke-opacity="0.45" stroke-width="12"/>
+    <g filter="url(#needleShadow)">
+      <path d="M565 249C574 221 615 230 611 259L564 763C560 806 498 812 485 770L414 543C409 527 412 510 424 499L565 249Z" fill="url(#needle)"/>
+      <path d="M565 249C574 221 615 230 611 259L564 763C560 806 498 812 485 770L414 543C409 527 412 510 424 499L565 249Z" stroke="white" stroke-opacity="0.72" stroke-width="14"/>
+      <path d="M457 560L586 262L527 534L534 775L457 560Z" fill="#FFFFFF" fill-opacity="0.2"/>
+    </g>
+    <circle cx="512" cy="512" r="43" fill="#FFFFFF"/>
+    <circle cx="512" cy="512" r="22" fill="#226BD1"/>
+    <path d="M239 512H295M729 512H785M512 239V295M512 729V785" stroke="white" stroke-opacity="0.72" stroke-width="18" stroke-linecap="round"/>
+    <rect x="106" y="106" width="812" height="812" rx="196" stroke="white" stroke-opacity="0.58" stroke-width="28"/>
+  </g>
+</svg>

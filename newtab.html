@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Safarian</title>
+    <link rel="stylesheet" href="src/styles.css">
+  </head>
+  <body>
+    <div class="background-layer" id="background-layer" aria-hidden="true"></div>
+
+    <main class="page-shell" aria-live="polite">
+      <header class="dashboard-header">
+        <div class="hero-copy">
+          <p class="date-line" id="date-line"></p>
+          <h1 id="greeting-line">New Tab</h1>
+        </div>
+        <form class="search-form" id="search-form" role="search">
+          <span class="search-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <circle cx="11" cy="11" r="8"></circle>
+              <path d="m21 21-4.35-4.35"></path>
+            </svg>
+          </span>
+          <input id="search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Search or enter website">
+          <button class="search-submit" type="submit" aria-label="Search">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+              <path d="M5 12h14"></path>
+              <path d="m12 5 7 7-7 7"></path>
+            </svg>
+          </button>
+        </form>
+      </header>
+
+      <section class="section section-recent" aria-labelledby="recent-heading">
+        <div class="section-heading-row">
+          <h2 id="recent-heading">Recently Closed Tabs</h2>
+          <button class="clear-button" id="clear-recent" type="button">Clear All</button>
+        </div>
+        <div class="recent-grid" id="recent-list"></div>
+      </section>
+
+      <section class="section" aria-labelledby="favorites-heading">
+        <h2 id="favorites-heading">Favorites</h2>
+        <div class="favorites-grid" id="favorites-list"></div>
+      </section>
+
+      <section class="section" aria-labelledby="suggestions-heading">
+        <h2 id="suggestions-heading">Suggestions</h2>
+        <div class="suggestions-row" id="suggestions-list"></div>
+      </section>
+    </main>
+
+    <aside class="customize-shell">
+      <section class="customize-panel" id="customize-panel" hidden>
+        <div class="customize-panel-header">
+          <h2>Customize</h2>
+          <button class="panel-close" id="customize-close" type="button" aria-label="Close customize panel"></button>
+        </div>
+
+        <div class="panel-group">
+          <div>
+            <h3>Appearance</h3>
+            <p>Choose a calm light or dark surface, or follow your system setting.</p>
+          </div>
+          <div class="appearance-control" role="group" aria-label="Appearance">
+            <button class="appearance-option" type="button" data-appearance="system">System</button>
+            <button class="appearance-option" type="button" data-appearance="light">Light</button>
+            <button class="appearance-option" type="button" data-appearance="dark">Dark</button>
+          </div>
+        </div>
+
+        <div class="panel-group">
+          <div>
+            <h3>Background</h3>
+            <p>Use a photo URL, upload an image, or generate a quiet random backdrop.</p>
+          </div>
+          <label class="background-url-field">
+            <span>Image URL</span>
+            <input id="background-url" type="url" placeholder="https://example.com/image.jpg">
+          </label>
+          <div class="panel-row">
+            <button id="background-save" type="button">Use URL</button>
+            <label class="background-file-button">
+              <input id="background-file" type="file" accept="image/*">
+              Upload
+            </label>
+            <button id="background-random" type="button">Random</button>
+            <button id="background-clear" type="button">Clear</button>
+          </div>
+        </div>
+      </section>
+
+      <button class="customize-toggle" id="customize-toggle" type="button" aria-label="Customize start page" aria-expanded="false" aria-controls="customize-panel">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 21v-7"/>
+          <path d="M4 10V3"/>
+          <path d="M12 21v-9"/>
+          <path d="M12 8V3"/>
+          <path d="M20 21v-5"/>
+          <path d="M20 12V3"/>
+          <path d="M2 14h4"/>
+          <path d="M10 8h4"/>
+          <path d="M18 16h4"/>
+        </svg>
+        <span>Customize</span>
+      </button>
+    </aside>
+
+    <div class="favorite-menu" id="favorite-menu" hidden>
+      <button id="favorite-menu-open" type="button">Open</button>
+      <button id="favorite-menu-edit" type="button">Edit</button>
+      <button id="favorite-menu-remove" type="button">Remove</button>
+      <hr>
+      <button id="favorite-menu-add" type="button">Add Favorite</button>
+      <button id="favorite-menu-refresh-icon" type="button">Refresh Icon</button>
+      <button id="favorite-menu-refresh" type="button">Reload Bookmarks</button>
+    </div>
+
+    <div class="favorite-modal" id="favorite-modal" hidden>
+      <form class="favorite-modal-card" id="favorite-form">
+        <div class="favorite-modal-header">
+          <h2 id="favorite-modal-title">Edit Favorite</h2>
+          <button class="panel-close" id="favorite-cancel-x" type="button" aria-label="Close favorite editor"></button>
+        </div>
+        <label>
+          <span>Name</span>
+          <input id="favorite-title-input" type="text" autocomplete="off" required>
+        </label>
+        <label>
+          <span>URL</span>
+          <input id="favorite-url-input" type="text" autocomplete="off" required>
+        </label>
+        <div class="favorite-modal-actions">
+          <button id="favorite-cancel" type="button">Cancel</button>
+          <button type="submit">Save</button>
+        </div>
+      </form>
+    </div>
+
+    <script src="src/newtab.js"></script>
+  </body>
+</html>
