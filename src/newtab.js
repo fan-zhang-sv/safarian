@@ -505,7 +505,27 @@ async function renderRecentlyClosed() {
     button.className = "recent-pill";
     button.type = "button";
     button.title = item.title;
-    button.textContent = item.title;
+    button.title = item.title;
+    
+    if (item.url && !item.url.startsWith("chrome://newtab")) {
+      const img = document.createElement("img");
+      img.className = "recent-pill-icon";
+      img.alt = "";
+      img.loading = "lazy";
+      loadIconSources(img, item.url, 64, () => {
+        img.hidden = true;
+      });
+      button.append(img);
+    } else {
+      const emptyIcon = document.createElement("div");
+      emptyIcon.className = "recent-pill-icon";
+      button.append(emptyIcon);
+    }
+    
+    const text = document.createElement("span");
+    text.className = "recent-pill-text";
+    text.textContent = item.title;
+    button.append(text);
     button.addEventListener("click", () => {
       if (IS_EXTENSION_CONTEXT && !item.sessionId.startsWith("preview-")) {
         chrome.sessions.restore(item.sessionId);
