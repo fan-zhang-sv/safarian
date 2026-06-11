@@ -1,74 +1,83 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Safarian Privacy Policy</title>
-    <meta
-      name="description"
-      content="Privacy policy for Safarian, a Chrome new tab extension for bookmarks, recently closed tabs, and local suggestions."
-    >
-    <link rel="canonical" href="./">
-    <link rel="stylesheet" href="styles.css">
-  </head>
-  <body>
-    <main class="policy-shell">
-      <header class="policy-header">
-        <p class="eyebrow">Safarian</p>
-        <h1>Privacy Policy</h1>
-        <p class="intro">
-          Safarian replaces Chrome's new tab page with a local dashboard for bookmarks, recently closed tabs,
-          and suggestions.
-        </p>
-        <p class="updated">Last updated: May 25, 2026</p>
-      </header>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Safarian - Your New Tab, Reimagined</title>
+  <meta name="description" content="Safarian replaces Chrome's new tab page with an elegant, safari-inspired personal landing page featuring bookmarks, recently closed tabs, and beautiful backgrounds.">
+  <link rel="canonical" href="./">
+  <link rel="stylesheet" href="landing.css">
+  <link rel="icon" type="image/png" href="../assets/icons/safarian-logo-128.png">
+</head>
+<body>
+  <div class="background-blobs">
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+  </div>
 
-      <section class="policy-section" aria-labelledby="data-used">
-        <h2 id="data-used">Data Used</h2>
-        <p>Safarian uses Chrome extension APIs to read:</p>
-        <ul>
-          <li>Bookmarks, to mirror the Chrome Bookmarks Bar as favorites.</li>
-          <li>Recently closed tabs, to show recoverable closed tabs.</li>
-          <li>Browsing history and top sites, to generate local suggestions.</li>
-          <li>Extension storage, to save appearance, background, cached site icon choices, and local display preferences.</li>
-          <li>
-            High-resolution site icon candidates plus geticon.dev, Google, DuckDuckGo, and Chrome's built-in
-            favicon endpoints, to display site icons.
-          </li>
-        </ul>
-      </section>
+  <nav class="navbar">
+    <div class="nav-content">
+      <div class="brand">
+        <span class="brand-text">Safarian</span>
+      </div>
+      <div class="nav-links">
+        <a href="https://chromewebstore.google.com/detail/cpkdiephlckepekadmgnmgackaicoebl" target="_blank" rel="noopener" class="btn btn-primary">Add to Chrome</a>
+      </div>
+    </div>
+  </nav>
 
-      <section class="policy-section" aria-labelledby="data-sharing">
-        <h2 id="data-sharing">Data Sharing</h2>
-        <p>
-          Safarian does not collect, sell, transmit, or share your bookmarks, browsing history, recently closed
-          tabs, top sites, or settings with the developer or any analytics service.
-        </p>
-        <p>
-          To display site icons, Safarian may load icons directly from the site's common icon files, such as
-          apple-touch-icon.png, PWA icon files, SVG favicons, or favicon.ico. If direct site icons are unavailable
-          or too small, Safarian may request an icon by domain from geticon.dev, Google favicon URLs, DuckDuckGo
-          favicon URLs, or Chrome's built-in favicon endpoint. Those image requests are made directly by your
-          browser to the icon host and can disclose the site domain needed to fetch the icon.
-        </p>
-        <p>
-          Background images are loaded only when you choose a remote image URL or request a random image. In those
-          cases, your browser requests that image directly from the image host you selected.
-        </p>
-      </section>
+  <main>
+    <section class="hero">
+      <h1 class="hero-title">Your New Tab,<br><span>Reimagined.</span></h1>
+      <p class="hero-subtitle">An elegant, Safari-inspired personal dashboard for Chrome. Fast, private, and beautiful.</p>
+      <div class="hero-actions">
+        <a href="https://chromewebstore.google.com/detail/cpkdiephlckepekadmgnmgackaicoebl" target="_blank" rel="noopener" class="btn btn-primary btn-large">Get Safarian</a>
+        <a href="#features" class="btn btn-secondary btn-large">Learn More</a>
+      </div>
+      
+      <div class="hero-image-wrapper">
+        <img src="safarian-screenshot.png" alt="Safarian Extension Screenshot" class="hero-image" loading="lazy">
+      </div>
+    </section>
 
-      <section class="policy-section" aria-labelledby="limited-use">
-        <h2 id="limited-use">Limited Use</h2>
-        <p>
-          Safarian's use of information received from Chrome APIs adheres to the Chrome Web Store User Data Policy,
-          including the Limited Use requirements.
-        </p>
-      </section>
+    <section id="features" class="features">
+      <h2 class="section-title">Everything you need. <br><span>Nothing you don't.</span></h2>
+      <div class="bento-grid">
+        <div class="bento-card feature-favorites">
+          <div class="bento-content">
+            <h3>Favorites</h3>
+            <p>Seamlessly integrated with Chrome bookmarks. Access your top sites instantly with beautiful, high-resolution icons.</p>
+          </div>
+        </div>
+        <div class="bento-card feature-closed">
+          <div class="bento-content">
+            <h3>Recently Closed</h3>
+            <p>Never lose a tab again. Safarian exposes your recently closed sessions so you can pick up exactly where you left off.</p>
+          </div>
+        </div>
+        <div class="bento-card feature-suggestions">
+          <div class="bento-content">
+            <h3>Suggestions</h3>
+            <p>Smart, local suggestions based on your browsing history, keeping your most visited sites just a click away.</p>
+          </div>
+        </div>
+        <div class="bento-card feature-backgrounds">
+          <div class="bento-content">
+            <h3>Custom Backgrounds</h3>
+            <p>Make it yours. Choose from daily random photos, elegant gradients, or use your own beautiful local images.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
 
-      <section class="policy-section" aria-labelledby="contact">
-        <h2 id="contact">Contact</h2>
-        <p>For privacy questions, contact the publisher listed on the Chrome Web Store listing.</p>
-      </section>
-    </main>
-  </body>
+  <footer class="footer">
+    <div class="footer-content">
+      <p class="copyright">&copy; 2026 Safarian. All rights reserved.</p>
+      <div class="footer-links">
+        <a href="privacy.html">Privacy Policy</a>
+      </div>
+    </div>
+  </footer>
+</body>
 </html>

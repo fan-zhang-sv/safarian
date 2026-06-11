@@ -1,28 +1,34 @@
 :root {
-  --page-bg: #e8ebe7;
-  --ink: #222827;
+  --page-bg: #f5f5f7;
+  --ink: #1d1d1f;
   --text: #454b49;
-  --muted: #747b78;
-  --line: rgba(50, 58, 56, 0.1);
-  --glass: rgba(255, 255, 255, 0.68);
-  --glass-strong: rgba(255, 255, 255, 0.86);
-  --accent: #2567d8;
-  --shadow-soft: 0 16px 38px rgba(46, 54, 52, 0.12);
-  --shadow-small: 0 9px 22px rgba(46, 54, 52, 0.1);
+  --muted: #86868b;
+  --line: rgba(0, 0, 0, 0.08);
+  --glass: rgba(255, 255, 255, 0.45);
+  --glass-strong: rgba(255, 255, 255, 0.65);
+  --glass-border: rgba(255, 255, 255, 0.4);
+  --accent: #0066cc;
+  --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.05);
+  --shadow-small: 0 20px 40px rgba(0, 0, 0, 0.1);
+  --blob-1: #ffb8d2;
+  --blob-2: #c5d2ff;
   color-scheme: light;
 }
 
 :root[data-theme="dark"] {
-  --page-bg: #4b504a;
-  --ink: #f3f5f1;
+  --page-bg: #000000;
+  --ink: #f5f5f7;
   --text: #c8d0cc;
-  --muted: #b2b8b1;
-  --line: rgba(220, 230, 224, 0.12);
-  --glass: rgba(52, 59, 53, 0.86);
-  --glass-strong: rgba(68, 74, 68, 0.9);
-  --accent: #8ab4ff;
-  --shadow-soft: 0 14px 34px rgba(0, 0, 0, 0.18);
-  --shadow-small: 0 9px 20px rgba(0, 0, 0, 0.14);
+  --muted: #86868b;
+  --line: rgba(255, 255, 255, 0.1);
+  --glass: rgba(29, 29, 31, 0.45);
+  --glass-strong: rgba(29, 29, 31, 0.65);
+  --glass-border: rgba(255, 255, 255, 0.15);
+  --accent: #2997ff;
+  --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.3);
+  --shadow-small: 0 30px 60px rgba(0, 0, 0, 0.4);
+  --blob-1: #5b283d;
+  --blob-2: #1e2d5c;
   color-scheme: dark;
 }
 
@@ -39,17 +45,60 @@ body {
   position: relative;
   min-height: 100vh;
   margin: 0;
-  background:
-    linear-gradient(115deg, rgba(255, 255, 255, 0.52), rgba(255, 255, 255, 0) 42%),
-    linear-gradient(180deg, #eff2ee 0%, #e3e7e2 48%, #dce1dd 100%);
+  background-color: var(--page-bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
   font-size: 14px;
   letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 :root[data-theme="dark"] body {
-  background: #4b504a;
+  background-color: var(--page-bg);
+}
+
+/* Background Gradients */
+.background-blobs {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  transition: opacity 220ms ease;
+}
+
+.blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(100px);
+  opacity: 0.6;
+  animation: float 20s infinite ease-in-out alternate;
+}
+
+.blob-1 {
+  top: -10%;
+  left: 10%;
+  width: 50vw;
+  height: 50vw;
+  background-color: var(--blob-1);
+}
+
+.blob-2 {
+  bottom: -10%;
+  right: 10%;
+  width: 60vw;
+  height: 60vw;
+  background-color: var(--blob-2);
+  animation-delay: -10s;
+}
+
+@keyframes float {
+  0% { transform: translate(0, 0) scale(1); }
+  100% { transform: translate(10%, 10%) scale(1.1); }
 }
 
 .background-layer {
@@ -80,6 +129,10 @@ body.has-background .background-layer {
   opacity: 1;
 }
 
+body.has-background .background-blobs {
+  opacity: 0;
+}
+
 body.has-background h1,
 body.has-background h2,
 body.has-background .date-line,
@@ -95,8 +148,10 @@ body.has-background .customize-panel,
 body.has-background .customize-toggle,
 body.has-background .favorite-modal-card,
 body.has-background .clear-button {
-  background: rgba(255, 255, 255, 0.68);
-  backdrop-filter: blur(22px);
+  background: var(--glass);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), inset 0 0 0 1px var(--glass-border), inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 
 :root[data-theme="dark"] body.has-background .search-form,
@@ -104,8 +159,10 @@ body.has-background .clear-button {
 :root[data-theme="dark"] body.has-background .customize-toggle,
 :root[data-theme="dark"] body.has-background .favorite-modal-card,
 :root[data-theme="dark"] body.has-background .clear-button {
-  background: rgba(52, 59, 53, 0.82);
-  backdrop-filter: blur(24px) saturate(1.12);
+  background: var(--glass);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3), inset 0 0 0 1px var(--glass-border), inset 0 1px 0 rgba(255, 255, 255, 0.1);
 }
 
 :root[data-theme="dark"] body.has-background .background-layer::after {
@@ -157,8 +214,9 @@ h1 {
   margin: 0;
   color: var(--ink);
   font-size: clamp(38px, 5vw, 62px);
-  font-weight: 760;
-  line-height: 0.96;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
 }
 
 .search-form {
@@ -168,13 +226,14 @@ h1 {
   gap: 10px;
   min-height: 58px;
   padding: 8px 12px 8px 18px;
-  border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 22px;
-  background: rgba(255, 255, 255, 0.7);
+  background: var(--glass);
   box-shadow:
     var(--shadow-soft),
-    inset 0 1px 0 rgba(255, 255, 255, 0.85);
-  backdrop-filter: blur(22px);
+    inset 0 0 0 1px var(--glass-border),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
 }
 
 .search-form:focus-within {
@@ -345,10 +404,11 @@ h1 {
 
 h2 {
   margin: 0 0 17px;
-  color: #4b514f;
+  color: var(--ink);
   font-size: 21px;
-  font-weight: 760;
+  font-weight: 700;
   line-height: 1.1;
+  letter-spacing: -0.02em;
 }
 
 .section-heading-row h2 {
@@ -396,11 +456,14 @@ h2 {
   height: 42px;
   padding: 0 18px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.78);
+  background: var(--glass);
   box-shadow:
-    0 9px 20px rgba(43, 50, 48, 0.06),
-    inset 0 1px 0 rgba(255, 255, 255, 0.82);
-  color: #1f2423;
+    0 9px 20px rgba(0, 0, 0, 0.06),
+    inset 0 0 0 1px var(--glass-border),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(30px) saturate(150%);
+  -webkit-backdrop-filter: blur(30px) saturate(150%);
+  color: var(--ink);
   cursor: pointer;
   font-size: 13px;
   line-height: 42px;
@@ -418,8 +481,8 @@ h2 {
 }
 
 .recent-pill:hover {
-  background: rgba(255, 255, 255, 0.93);
-  box-shadow: 0 13px 26px rgba(43, 50, 48, 0.1);
+  background: var(--glass-strong);
+  box-shadow: 0 13px 26px rgba(0, 0, 0, 0.1), inset 0 0 0 1px var(--glass-border), inset 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
 .recent-pill:active,
@@ -509,13 +572,15 @@ body.favorite-dragging .favorite-item {
   position: relative;
   width: 70px;
   height: 70px;
-  border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 18px;
   place-items: center;
-  background: rgba(255, 255, 255, 0.74);
+  background: var(--glass);
   box-shadow:
     var(--shadow-small),
-    inset 0 1px 0 rgba(255, 255, 255, 0.86);
+    inset 0 0 0 1px var(--glass-border),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(30px) saturate(150%);
+  -webkit-backdrop-filter: blur(30px) saturate(150%);
   color: rgba(255, 255, 255, 0.94);
   font-size: 31px;
   font-weight: 720;
@@ -545,8 +610,8 @@ body.favorite-dragging .favorite-item {
 }
 
 .favorite-item:hover .favorite-icon {
-  background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 16px 32px rgba(43, 50, 48, 0.13);
+  background: var(--glass-strong);
+  box-shadow: 0 16px 32px rgba(0, 0, 0, 0.13), inset 0 0 0 1px var(--glass-border), inset 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
 .favorite-icon img {
@@ -763,13 +828,14 @@ body.favorite-dragging .favorite-item {
   z-index: 10;
   width: 188px;
   padding: 7px;
-  border: 1px solid rgba(255, 255, 255, 0.74);
   border-radius: 15px;
-  background: rgba(246, 248, 246, 0.86);
+  background: var(--glass-strong);
   box-shadow:
-    0 22px 64px rgba(24, 30, 28, 0.26),
-    inset 0 1px 0 rgba(255, 255, 255, 0.84);
-  backdrop-filter: blur(26px) saturate(1.15);
+    0 22px 64px rgba(0, 0, 0, 0.26),
+    inset 0 0 0 1px var(--glass-border),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
 }
 
 .favorite-menu[hidden] {
@@ -817,15 +883,15 @@ body.favorite-dragging .favorite-item {
   gap: 8px;
   min-height: 36px;
   padding: 0 14px;
-  border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 999px;
-  background: rgba(88, 93, 91, 0.58);
-  box-shadow: 0 14px 34px rgba(24, 30, 28, 0.18);
+  background: rgba(88, 93, 91, 0.45);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.18), inset 0 0 0 1px var(--glass-border), inset 0 1px 0 rgba(255, 255, 255, 0.2);
   color: #fff;
   cursor: pointer;
   font-size: 13px;
   font-weight: 750;
-  backdrop-filter: blur(20px);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
 }
 
 .customize-toggle:hover,
@@ -846,14 +912,15 @@ body.favorite-dragging .favorite-item {
 .customize-panel {
   width: min(390px, calc(100vw - 32px));
   padding: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.74);
   border-radius: 24px;
-  background: rgba(246, 248, 246, 0.78);
+  background: var(--glass-strong);
   box-shadow:
-    0 24px 70px rgba(24, 30, 28, 0.25),
-    inset 0 1px 0 rgba(255, 255, 255, 0.84);
-  color: #29312f;
-  backdrop-filter: blur(28px) saturate(1.18);
+    0 24px 70px rgba(0, 0, 0, 0.25),
+    inset 0 0 0 1px var(--glass-border),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  color: var(--text);
+  backdrop-filter: blur(50px) saturate(200%);
+  -webkit-backdrop-filter: blur(50px) saturate(200%);
 }
 
 .customize-panel[hidden] {
@@ -940,8 +1007,9 @@ body.favorite-dragging .favorite-item {
   display: grid;
   place-items: center;
   padding: 20px;
-  background: rgba(10, 14, 13, 0.26);
-  backdrop-filter: blur(10px);
+  background: rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
 }
 
 .favorite-modal[hidden] {
@@ -953,11 +1021,11 @@ body.favorite-dragging .favorite-item {
   gap: 13px;
   width: min(420px, 100%);
   padding: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.76);
   border-radius: 24px;
-  background: rgba(246, 248, 246, 0.9);
-  box-shadow: 0 28px 80px rgba(24, 30, 28, 0.28);
-  backdrop-filter: blur(30px) saturate(1.15);
+  background: var(--glass-strong);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.28), inset 0 0 0 1px var(--glass-border), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(50px) saturate(200%);
+  -webkit-backdrop-filter: blur(50px) saturate(200%);
 }
 
 .favorite-modal-card label {
