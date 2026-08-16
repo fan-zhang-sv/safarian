@@ -1,15 +1,16 @@
 "use strict";
 
 const MAX_RECENT = 9;
-const MAX_FAVORITES = 44;
 const MAX_SUGGESTIONS = 6;
 const HISTORY_RANGE_DAYS = 120;
 const STORAGE_KEY = "recentClosedClearedAt";
 const BACKGROUND_KEY = "landingBackground";
 const APPEARANCE_KEY = "landingAppearance";
+const THEME_KEY = "landingTheme";
 const ICON_CACHE_KEY = "faviconCache";
 const ICON_CACHE_TTL = 14 * 24 * 60 * 60 * 1000;
 const IS_EXTENSION_CONTEXT = hasExtensionApis();
+const VALID_THEMES = ["classic", "sunset", "emerald", "twilight", "titanium", "rose", "solaris"];
 let favoritesState = [];
 let favoritesEditMode = false;
 let editingFavoriteIndex = null;
@@ -19,19 +20,85 @@ let favoriteDrag = null;
 let favoriteDropIndex = null;
 let suppressFavoriteClick = false;
 let bookmarksBarId = null;
+let favoritesRenderRequest = 0;
+let favoritesRefreshPending = false;
+let favoritesRefreshTimeout = 0;
 let iconCache = null;
 let iconCachePromise = null;
 
-const palette = [
-  ["#367fe7", "#1a5fc2"],
-  ["#17458e", "#102f64"],
-  ["#48649b", "#24436f"],
-  ["#10572f", "#082d18"],
-  ["#4b5580", "#252f52"],
-  ["#263e65", "#172842"],
-  ["#267293", "#143f57"],
-  ["#625391", "#382f69"]
-];
+const themePalettes = {
+  classic: [
+    ["#367fe7", "#1a5fc2"],
+    ["#17458e", "#102f64"],
+    ["#48649b", "#24436f"],
+    ["#10572f", "#082d18"],
+    ["#4b5580", "#252f52"],
+    ["#263e65", "#172842"],
+    ["#267293", "#143f57"],
+    ["#625391", "#382f69"]
+  ],
+  sunset: [
+    ["#ea580c", "#9a3412"],
+    ["#f97316", "#c2410c"],
+    ["#d97706", "#92400e"],
+    ["#e11d48", "#881337"],
+    ["#c026d3", "#701a75"],
+    ["#b45309", "#78350f"],
+    ["#e65100", "#bf360c"],
+    ["#be123c", "#4c0519"]
+  ],
+  emerald: [
+    ["#059669", "#064e3b"],
+    ["#0d9488", "#115e59"],
+    ["#10b981", "#047857"],
+    ["#0284c7", "#075985"],
+    ["#14b8a6", "#134e4a"],
+    ["#15803d", "#14532d"],
+    ["#0e7490", "#164e63"],
+    ["#047857", "#064e3b"]
+  ],
+  twilight: [
+    ["#7c3aed", "#4c1d95"],
+    ["#6366f1", "#3730a3"],
+    ["#8b5cf6", "#5b21b6"],
+    ["#a855f7", "#6b21a8"],
+    ["#4f46e5", "#312e81"],
+    ["#9333ea", "#581c87"],
+    ["#3b82f6", "#1e3a8a"],
+    ["#6d28d9", "#3b0764"]
+  ],
+  titanium: [
+    ["#475569", "#1e293b"],
+    ["#334155", "#0f172a"],
+    ["#2563eb", "#1d4ed8"],
+    ["#0284c7", "#0c4a6e"],
+    ["#64748b", "#334155"],
+    ["#52525b", "#27272a"],
+    ["#3b82f6", "#1e40af"],
+    ["#4b5563", "#1f2937"]
+  ],
+  rose: [
+    ["#e11d48", "#881337"],
+    ["#db2777", "#831843"],
+    ["#f43f5e", "#9f1239"],
+    ["#be123c", "#4c0519"],
+    ["#ec4899", "#9d174d"],
+    ["#9f1239", "#4c0519"],
+    ["#d946ef", "#701a75"],
+    ["#f43f5e", "#881337"]
+  ],
+  solaris: [
+    ["#d97706", "#78350f"],
+    ["#b45309", "#451a03"],
+    ["#ca8a04", "#713f12"],
+    ["#eab308", "#854d0e"],
+    ["#ea580c", "#7c2d12"],
+    ["#c2410c", "#431407"],
+    ["#f59e0b", "#92400e"],
+    ["#d97706", "#451a03"]
+  ]
+};
+const palette = themePalettes.classic;
 
 const fallbackRecent = [
   { sessionId: "preview-1", title: "apple developer - Google Search", url: "https://developer.apple.com", lastModified: Date.now() },
@@ -160,6 +227,7 @@ async function setupCustomizeControls() {
   const panel = document.querySelector("#customize-panel");
   const toggle = document.querySelector("#customize-toggle");
   const closeButton = document.querySelector("#customize-close");
+  const themeButtons = document.querySelectorAll("[data-theme-option]");
   const appearanceButtons = document.querySelectorAll("[data-appearance]");
   const urlInput = document.querySelector("#background-url");
   const saveButton = document.querySelector("#background-save");
@@ -167,8 +235,17 @@ async function setupCustomizeControls() {
   const clearButton = document.querySelector("#background-clear");
   const fileInput = document.querySelector("#background-file");
 
+  await applyStoredTheme();
   await applyStoredAppearance();
   await applyStoredBackground();
+
+  themeButtons.forEach((button) => {
+    button.addEventListener("click", async () => {
+      const theme = normalizeThemeName(button.dataset.themeOption);
+      await saveTheme(theme);
+      updateSuggestionPalettes(theme);
+    });
+  });
 
   appearanceButtons.forEach((button) => {
     button.addEventListener("click", async () => {
@@ -303,16 +380,40 @@ function setupFavoriteContextMenu() {
 function setupBookmarkMirrorListeners() {
   if (!IS_EXTENSION_CONTEXT || !chrome.bookmarks) return;
 
-  const refresh = debounce(async () => {
-    if (!favoritesEditMode) {
-      await renderFavorites();
-    }
-  }, 120);
+  const refresh = () => requestFavoritesRefresh();
 
   chrome.bookmarks.onCreated.addListener(refresh);
   chrome.bookmarks.onChanged.addListener(refresh);
   chrome.bookmarks.onMoved.addListener(refresh);
   chrome.bookmarks.onRemoved.addListener(refresh);
+  chrome.bookmarks.onChildrenReordered?.addListener(refresh);
+  chrome.bookmarks.onImportEnded?.addListener(refresh);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      requestFavoritesRefresh({ immediate: true });
+    }
+  });
+  window.addEventListener("focus", () => {
+    requestFavoritesRefresh({ immediate: true });
+  });
+}
+
+function requestFavoritesRefresh({ immediate = false } = {}) {
+  if (!IS_EXTENSION_CONTEXT) return;
+
+  favoritesRefreshPending = true;
+  window.clearTimeout(favoritesRefreshTimeout);
+  favoritesRefreshTimeout = window.setTimeout(flushFavoritesRefresh, immediate ? 0 : 120);
+}
+
+function flushFavoritesRefresh() {
+  favoritesRefreshTimeout = 0;
+
+  if (!favoritesRefreshPending || favoriteDrag) return;
+
+  favoritesRefreshPending = false;
+  void renderFavorites();
 }
 
 function setupFavoriteEditor() {
@@ -390,6 +491,44 @@ function hideFavoriteMenu() {
   const menu = document.querySelector("#favorite-menu");
   menu.hidden = true;
   favoriteMenuIndex = null;
+}
+
+async function applyStoredTheme() {
+  const theme = await getStorageValue(THEME_KEY, "classic");
+  applyTheme(theme);
+}
+
+async function saveTheme(theme) {
+  const normalized = normalizeThemeName(theme);
+  await setStorageValue(THEME_KEY, normalized);
+  applyTheme(normalized);
+}
+
+function applyTheme(theme) {
+  const normalized = normalizeThemeName(theme);
+  document.documentElement.dataset.themeName = normalized;
+  document.querySelectorAll("[data-theme-option]").forEach((button) => {
+    const selected = button.dataset.themeOption === normalized;
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
+}
+
+function normalizeThemeName(theme) {
+  return VALID_THEMES.includes(theme) ? theme : "classic";
+}
+
+function updateSuggestionPalettes(themeName) {
+  const normalized = normalizeThemeName(themeName);
+  const activePalette = themePalettes[normalized] || themePalettes.classic;
+  const cards = document.querySelectorAll(".suggestion-card");
+  cards.forEach((card, index) => {
+    const colors = activePalette[index % activePalette.length];
+    if (colors) {
+      card.style.setProperty("--card-start", colors[0]);
+      card.style.setProperty("--card-end", colors[1]);
+    }
+  });
 }
 
 async function applyStoredAppearance() {
@@ -576,10 +715,12 @@ function normalizeSession(session) {
 }
 
 async function renderFavorites() {
+  const request = ++favoritesRenderRequest;
+  const favorites = await loadFavorites();
+  if (request !== favoritesRenderRequest) return;
+
   const favoritesList = document.querySelector("#favorites-list");
   clearChildren(favoritesList);
-
-  const favorites = await loadFavorites();
   favoritesState = favorites;
 
   if (favorites.length === 0) {
@@ -683,7 +824,6 @@ async function loadFavorites() {
   bookmarksBarId = bookmarksBar ? bookmarksBar.id : "1";
 
   return directBookmarkChildren(bookmarksBar)
-    .slice(0, MAX_FAVORITES)
     .map((bookmark, index) => ({
       id: bookmark.id,
       parentId: bookmark.parentId || bookmarksBarId,
@@ -769,6 +909,10 @@ async function finishFavoritePointerReorder(event) {
   reorderSourceIndex = null;
   favoriteDropIndex = null;
   await renderFavorites();
+
+  if (favoritesRefreshPending) {
+    requestFavoritesRefresh({ immediate: true });
+  }
 }
 
 function beginFavoriteDrag() {
@@ -849,6 +993,10 @@ function setFavoriteDropTarget(index) {
 function cancelFavoriteDrag() {
   cleanupFavoriteDrag();
   favoriteDropIndex = null;
+
+  if (favoritesRefreshPending) {
+    requestFavoritesRefresh({ immediate: true });
+  }
 }
 
 function cleanupFavoriteDrag() {
@@ -883,13 +1031,17 @@ function exitReorderMode() {
 
 function findBookmarksBar(nodes) {
   const queue = Array.isArray(nodes) ? [...nodes] : [];
+  const bookmarkBars = [];
+  let legacyMatch = null;
 
   while (queue.length) {
     const node = queue.shift();
     if (!node) continue;
 
-    if (node.id === "1" || /bookmarks bar|favorites/i.test(node.title || "")) {
-      return node;
+    if (node.folderType === "bookmarks-bar") {
+      bookmarkBars.push(node);
+    } else if (!legacyMatch && (node.id === "1" || /bookmarks bar|favorites/i.test(node.title || ""))) {
+      legacyMatch = node;
     }
 
     if (Array.isArray(node.children)) {
@@ -897,7 +1049,7 @@ function findBookmarksBar(nodes) {
     }
   }
 
-  return null;
+  return bookmarkBars.find((node) => node.syncing) || bookmarkBars[0] || legacyMatch;
 }
 
 function directBookmarkChildren(bookmarksBar) {
@@ -968,7 +1120,9 @@ async function moveFavorite(fromIndex, toIndex) {
 
   await callChrome(chrome.bookmarks.move, existing.id, {
     parentId: existing.parentId || bookmarksBarId || "1",
-    index: toIndex
+    index: Number.isInteger(favoritesState[toIndex]?.index)
+      ? favoritesState[toIndex].index
+      : toIndex
   });
 }
 
@@ -983,8 +1137,11 @@ async function renderSuggestions() {
     return;
   }
 
+  const currentTheme = normalizeThemeName(document.documentElement.dataset.themeName || "classic");
+  const activePalette = themePalettes[currentTheme] || themePalettes.classic;
+
   suggestions.slice(0, MAX_SUGGESTIONS).forEach((suggestion, index) => {
-    const colors = palette[index % palette.length];
+    const colors = activePalette[index % activePalette.length];
     const card = document.createElement("button");
     card.className = "suggestion-card";
     card.type = "button";
