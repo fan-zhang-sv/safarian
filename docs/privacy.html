@@ -6,7 +6,7 @@
     <title>Safarian Privacy Policy</title>
     <meta
       name="description"
-      content="Privacy policy for Safarian, a Chrome new tab extension for bookmarks, recently closed tabs, and local suggestions."
+      content="Privacy policy for Safarian, a Chrome new tab extension with bookmarks, session recovery, ongoing journeys, and on-device AI."
     >
     <link rel="canonical" href="./privacy.html">
     <link rel="stylesheet" href="styles.css">
@@ -17,10 +17,10 @@
         <p class="eyebrow">Safarian</p>
         <h1>Privacy Policy</h1>
         <p class="intro">
-          Safarian replaces Chrome's new tab page with a local dashboard for bookmarks, recently closed tabs,
-          and suggestions.
+          Safarian replaces Chrome's new tab page with a local dashboard for bookmarks, session recovery,
+          history recall, and ongoing journeys.
         </p>
-        <p class="updated">Last updated: May 25, 2026</p>
+        <p class="updated">Last updated: August 16, 2026</p>
       </header>
 
       <section class="policy-section" aria-labelledby="data-used">
@@ -29,20 +29,45 @@
         <ul>
           <li>Bookmarks, to mirror the Chrome Bookmarks Bar as favorites.</li>
           <li>Recently closed tabs, to show recoverable closed tabs.</li>
-          <li>Browsing history and top sites, to generate local suggestions.</li>
-          <li>Extension storage, to save appearance, background, cached site icon choices, and local display preferences.</li>
+          <li>Browsing history, to power local Recall and identify repeated activity for Continue.</li>
+          <li>Extension storage, to save appearance, background, cached site icon choices, local display preferences, cached on-device AI results, and retry metadata.</li>
           <li>
             High-resolution site icon candidates plus geticon.dev, Google, DuckDuckGo, and Chrome's built-in
             favicon endpoints, to display site icons.
           </li>
         </ul>
+        <p>
+          When you explicitly use Recall, Safarian provides a limited set of page titles, site domains, URL paths,
+          and visit times from local Chrome history to Chrome's built-in Gemini Nano model. The model runs on your
+          device. Recall can return only references to real history entries and does not create or store new URLs.
+        </p>
+        <p>
+          When Chrome's on-device model is already available, Smart Recent Tabs automatically provides titles,
+          domains, close times, and limited window-tab titles from up to 18 eligible recoverable web sessions to that
+          model when a new tab opens. Safarian never starts a model download for this automatic action. Gemini
+          returns only references to those real sessions. Fingerprinted group labels and session identifiers are cached locally
+          for six hours so unchanged sessions are not repeatedly processed. You can return to chronological order
+          at any time.
+        </p>
+        <p>
+          When the on-device model is already available, Continue examines activity from the last 30 days that
+          occurred across multiple days, excluding exact Favorite and Recently Closed URLs. Safarian provides
+          eligible page titles, domains, URL paths, visit counts, active-day counts, and recency to the local model.
+          Gemini can only group references to those real pages. Fingerprinted journey labels and page URLs are cached locally for
+          12 hours. Small local attempt records apply cooldowns after empty results, unavailable-model states, or failures
+          so unchanged activity is not repeatedly processed. If there is no strong multi-page journey, the section remains hidden.
+        </p>
       </section>
 
       <section class="policy-section" aria-labelledby="data-sharing">
         <h2 id="data-sharing">Data Sharing</h2>
         <p>
           Safarian does not collect, sell, transmit, or share your bookmarks, browsing history, recently closed
-          tabs, top sites, or settings with the developer or any analytics service.
+          tabs, or settings with the developer or any analytics service.
+        </p>
+        <p>
+          Recall, Smart Recent Tabs, and Continue do not send browsing or session data to Google or another cloud AI
+          provider. Chrome may download and manage the Gemini Nano model, but inference runs locally after that download.
         </p>
         <p>
           To display site icons, Safarian may load icons directly from the site's common icon files, such as

@@ -19,39 +19,90 @@
           <p class="date-line" id="date-line"></p>
           <h1 id="greeting-line">New Tab</h1>
         </div>
-        <form class="search-form" id="search-form" role="search">
-          <span class="search-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false">
-              <circle cx="11" cy="11" r="8"></circle>
-              <path d="m21 21-4.35-4.35"></path>
-            </svg>
-          </span>
-          <input id="search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Search or enter website">
-          <button class="search-submit" type="submit" aria-label="Search">
-            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-              <path d="M5 12h14"></path>
-              <path d="m12 5 7 7-7 7"></path>
-            </svg>
-          </button>
-        </form>
+        <div class="search-stack">
+          <form class="search-form" id="search-form" role="search">
+            <span class="search-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <circle cx="11" cy="11" r="8"></circle>
+                <path d="m21 21-4.35-4.35"></path>
+              </svg>
+            </span>
+            <input id="search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Search, enter a site, or describe a page">
+            <button class="recall-button" id="recall-button" type="button" aria-label="Recall a page with on-device Gemini" title="Describe a page you remember, then let Gemini find it in your history">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <path d="M12 2.8c.7 5.2 4 8.5 9.2 9.2-5.2.7-8.5 4-9.2 9.2-.7-5.2-4-8.5-9.2-9.2 5.2-.7 8.5-4 9.2-9.2Z"></path>
+                <path d="M19 2v4"></path>
+                <path d="M17 4h4"></path>
+              </svg>
+              <span>Recall</span>
+            </button>
+            <button class="search-submit" type="submit" aria-label="Search">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <path d="M5 12h14"></path>
+                <path d="m12 5 7 7-7 7"></path>
+              </svg>
+            </button>
+          </form>
+
+          <section class="recall-panel" id="recall-panel" aria-labelledby="recall-heading" aria-live="polite" hidden>
+            <div class="recall-panel-header">
+              <div>
+                <span class="recall-eyebrow">
+                  <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                    <path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path>
+                  </svg>
+                  On-device Gemini
+                </span>
+                <h2 id="recall-heading">Recall from history</h2>
+              </div>
+              <button class="recall-close" id="recall-close" type="button" aria-label="Close recall results"></button>
+            </div>
+            <div id="recall-content"></div>
+            <p class="recall-privacy">
+              Page titles and URLs are processed only on this device. Nothing is sent to Safarian or a cloud AI.
+            </p>
+          </section>
+        </div>
       </header>
 
       <section class="section section-recent" aria-labelledby="recent-heading">
         <div class="section-heading-row">
-          <h2 id="recent-heading">Recently Closed Tabs</h2>
-          <button class="clear-button" id="clear-recent" type="button">Clear All</button>
+          <div class="recent-heading-copy">
+            <h2 id="recent-heading">Recently Closed Tabs</h2>
+            <p class="recent-mode-note" id="recent-mode-note" role="status" aria-live="polite" hidden></p>
+          </div>
+          <div class="recent-actions">
+            <button class="recent-organize-button" id="recent-organize" type="button" aria-pressed="false" title="Group and rank recently closed tabs with on-device Gemini">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path>
+              </svg>
+              <span>Organize</span>
+            </button>
+            <button class="clear-button" id="clear-recent" type="button">Clear All</button>
+          </div>
         </div>
-        <div class="recent-grid" id="recent-list"></div>
+        <div class="recent-grid" id="recent-list" aria-busy="false"></div>
+      </section>
+
+      <section class="section section-continue" id="continue-section" aria-labelledby="continue-heading" aria-busy="false" hidden>
+        <div class="continue-heading-row">
+          <div>
+            <h2 id="continue-heading">Continue</h2>
+            <p id="continue-subtitle" role="status" aria-live="polite">Ongoing journeys from your recent activity</p>
+          </div>
+          <span class="continue-private-badge">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+              <path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path>
+            </svg>
+            <span id="continue-badge-label">Grouped on-device</span>
+          </span>
+        </div>
+        <div class="journeys-grid" id="continue-list"></div>
       </section>
 
       <section class="section" aria-labelledby="favorites-heading">
         <h2 id="favorites-heading">Favorites</h2>
         <div class="favorites-grid" id="favorites-list"></div>
-      </section>
-
-      <section class="section" aria-labelledby="suggestions-heading">
-        <h2 id="suggestions-heading">Suggestions</h2>
-        <div class="suggestions-row" id="suggestions-list"></div>
       </section>
     </main>
 

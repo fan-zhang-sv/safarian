@@ -1,16 +1,31 @@
 "use strict";
 
 const MAX_RECENT = 9;
-const MAX_SUGGESTIONS = 6;
-const HISTORY_RANGE_DAYS = 120;
 const STORAGE_KEY = "recentClosedClearedAt";
 const BACKGROUND_KEY = "landingBackground";
 const APPEARANCE_KEY = "landingAppearance";
 const THEME_KEY = "landingTheme";
 const ICON_CACHE_KEY = "faviconCache";
+const RECENT_ORGANIZATION_CACHE_KEY = "recentClosedOrganization";
+const CONTINUE_JOURNEY_CACHE_KEY = "continueJourneys";
+const AI_ATTEMPT_STATE_KEY = "browserAiAttemptState";
+const AI_ORGANIZER_LOCK_NAME = "safarian-browser-ai-organizer";
 const ICON_CACHE_TTL = 14 * 24 * 60 * 60 * 1000;
+const RECENT_ORGANIZATION_CACHE_TTL = 6 * 60 * 60 * 1000;
+const CONTINUE_JOURNEY_CACHE_TTL = 12 * 60 * 60 * 1000;
+const CONTINUE_RANGE_DAYS = 30;
+const MAX_RECENT_ORGANIZER_CANDIDATES = 18;
+const MAX_CONTINUE_CANDIDATES = 24;
+const RECALL_RANGE_DAYS = 180;
+const MAX_RECALL_CANDIDATES = 70;
 const IS_EXTENSION_CONTEXT = hasExtensionApis();
+const SHOW_AI_LOADING_PREVIEW = !IS_EXTENSION_CONTEXT && new URLSearchParams(window.location.search).has("preview-ai-loading");
 const VALID_THEMES = ["classic", "sunset", "emerald", "twilight", "titanium", "rose", "solaris"];
+const LANGUAGE_MODEL_OPTIONS = {
+  expectedInputs: [{ type: "text", languages: ["en"] }],
+  expectedOutputs: [{ type: "text", languages: ["en"] }]
+};
+const PREVIEW_TIMESTAMP = Date.now();
 let favoritesState = [];
 let favoritesEditMode = false;
 let editingFavoriteIndex = null;
@@ -25,6 +40,12 @@ let favoritesRefreshPending = false;
 let favoritesRefreshTimeout = 0;
 let iconCache = null;
 let iconCachePromise = null;
+let recentDisplayMode = "smart";
+let recentItemsState = [];
+let recentRenderRequest = 0;
+let browserOrganizerSession = null;
+let browserOrganizerSessionPromise = null;
+let browserOrganizerPromptQueue = Promise.resolve();
 
 const themePalettes = {
   classic: [
@@ -164,12 +185,26 @@ const iconColors = [
 
 document.addEventListener("DOMContentLoaded", () => {
   const clearButton = document.querySelector("#clear-recent");
+  const recentOrganizeButton = document.querySelector("#recent-organize");
   const searchForm = document.querySelector("#search-form");
   const searchInput = document.querySelector("#search-input");
+  const recallButton = document.querySelector("#recall-button");
+  const recallClose = document.querySelector("#recall-close");
 
   clearButton.addEventListener("click", async () => {
     await setStorageValue(STORAGE_KEY, Date.now());
     await renderRecentlyClosed();
+  });
+
+  recentOrganizeButton.addEventListener("click", async () => {
+    if (recentDisplayMode === "smart") {
+      recentDisplayMode = "recent";
+      await renderRecentlyClosed();
+      return;
+    }
+
+    recentDisplayMode = "smart";
+    await renderRecentlyClosed({ forceOrganize: true, allowDownload: true });
   });
 
   searchForm.addEventListener("submit", (event) => {
@@ -179,20 +214,437 @@ document.addEventListener("DOMContentLoaded", () => {
     window.location.href = destinationForQuery(query);
   });
 
+  recallButton.addEventListener("click", () => {
+    void recallFromHistory();
+  });
+
+  recallClose.addEventListener("click", hideRecallPanel);
+
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && event.shiftKey) {
+      event.preventDefault();
+      void recallFromHistory();
+      return;
+    }
+
+    if (event.key === "Escape") {
+      hideRecallPanel();
+    }
+  });
+
   setHeaderText();
   setupCustomizeControls();
   setupFavoriteEditor();
   setupFavoriteContextMenu();
   setupBookmarkMirrorListeners();
+  void updateRecallAvailabilityHint();
   loadPage();
 });
+
+window.addEventListener("pagehide", () => {
+  resetBrowserOrganizerSession();
+});
+
+async function updateRecallAvailabilityHint() {
+  const button = document.querySelector("#recall-button");
+  if (!button) return;
+
+  if (!globalThis.LanguageModel || typeof LanguageModel.availability !== "function") {
+    button.dataset.availability = "unavailable";
+    button.title = "Gemini is unavailable here; Recall will use local title matching instead";
+    return;
+  }
+
+  try {
+    const availability = await LanguageModel.availability(LANGUAGE_MODEL_OPTIONS);
+    button.dataset.availability = availability;
+    button.title = availability === "available"
+      ? "Describe a page you remember, then let on-device Gemini find it in your history"
+      : availability === "downloadable" || availability === "downloading"
+        ? "Recall a page; Chrome may first download its on-device Gemini model"
+        : "Gemini is unavailable on this device; Recall will use local title matching";
+  } catch (error) {
+    console.warn("Unable to check Chrome built-in AI availability", error);
+  }
+}
+
+async function recallFromHistory() {
+  const input = document.querySelector("#search-input");
+  const query = input.value.trim();
+
+  showRecallPanel();
+
+  if (!query) {
+    renderRecallStatus({
+      icon: "?",
+      title: "What do you remember?",
+      detail: "Try something like “the design article about calm interfaces I read last month.”"
+    });
+    input.focus();
+    return;
+  }
+
+  setRecallBusy(true);
+  renderRecallStatus({
+    icon: "✦",
+    title: "Checking your history",
+    detail: "Preparing real pages for a private, on-device match.",
+    loading: true
+  });
+
+  const candidatesPromise = loadRecallCandidates(query);
+
+  try {
+    if (!globalThis.LanguageModel || typeof LanguageModel.availability !== "function") {
+      const candidates = await candidatesPromise;
+      renderLocalRecallFallback(query, candidates, "Gemini is not available on this device, so these are direct title matches.");
+      return;
+    }
+
+    const availability = await LanguageModel.availability(LANGUAGE_MODEL_OPTIONS);
+    if (availability === "unavailable") {
+      const candidates = await candidatesPromise;
+      renderLocalRecallFallback(query, candidates, "Gemini is not supported by this Chrome or device, so these are direct title matches.");
+      return;
+    }
+
+    if (availability === "downloadable" || availability === "downloading") {
+      renderRecallStatus({
+        icon: "↓",
+        title: availability === "downloadable" ? "Getting Gemini ready" : "Gemini is downloading",
+        detail: "Chrome downloads the model once. Your history stays on this device.",
+        loading: true
+      });
+    }
+
+    const session = await LanguageModel.create({
+      ...LANGUAGE_MODEL_OPTIONS,
+      monitor(monitor) {
+        monitor.addEventListener("downloadprogress", (event) => {
+          const progress = Math.max(0, Math.min(100, Math.round(event.loaded * 100)));
+          renderRecallStatus({
+            icon: `${progress}%`,
+            title: progress < 100 ? "Downloading Gemini" : "Loading Gemini",
+            detail: progress < 100
+              ? "A one-time Chrome download. Your history remains private."
+              : "The on-device model is almost ready.",
+            loading: true
+          });
+        });
+      }
+    });
+
+    try {
+      const candidates = await candidatesPromise;
+      if (!candidates.length) {
+        renderRecallStatus({
+          icon: "0",
+          title: "No history to search",
+          detail: "Browse normally for a while, then Recall can help recover pages you have seen."
+        });
+        return;
+      }
+
+      renderRecallStatus({
+        icon: "✦",
+        title: "Remembering with Gemini",
+        detail: `Comparing your description with ${candidates.length} real history entries on this device.`,
+        loading: true
+      });
+
+      const matches = await rankRecallCandidatesWithGemini(session, query, candidates);
+      if (!matches.length) {
+        renderLocalRecallFallback(query, candidates, "Gemini found no confident semantic match. Here are the closest direct title matches.");
+        return;
+      }
+
+      renderRecallResults(matches);
+    } finally {
+      session.destroy();
+    }
+  } catch (error) {
+    console.warn("Chrome built-in Gemini recall failed", error);
+    const candidates = await candidatesPromise.catch(() => []);
+    renderLocalRecallFallback(query, candidates, "Gemini could not finish this match. Here are the closest direct title matches.");
+  } finally {
+    setRecallBusy(false);
+  }
+}
+
+async function loadRecallCandidates(query) {
+  if (!IS_EXTENSION_CONTEXT) {
+    return dedupeByUrl([
+      ...fallbackSuggestions,
+      ...fallbackRecent,
+      ...fallbackFavorites.map((favorite) => ({ ...favorite, lastVisitTime: 0 }))
+    ]).slice(0, MAX_RECALL_CANDIDATES);
+  }
+
+  const startTime = Date.now() - RECALL_RANGE_DAYS * 24 * 60 * 60 * 1000;
+  const [literalMatches, recentHistory] = await Promise.all([
+    callChrome(chrome.history.search, {
+      text: query,
+      startTime,
+      maxResults: MAX_RECALL_CANDIDATES
+    }),
+    callChrome(chrome.history.search, {
+      text: "",
+      startTime,
+      maxResults: 140
+    })
+  ]);
+
+  return dedupeByUrl([...literalMatches, ...recentHistory])
+    .filter((item) => item.url && isHttpUrl(item.url))
+    .filter((item) => !isSearchOrInternalPage(item.url))
+    .map((item) => ({
+      title: readableTitle(item.title, item.url),
+      url: item.url,
+      lastVisitTime: item.lastVisitTime || 0
+    }))
+    .slice(0, MAX_RECALL_CANDIDATES);
+}
+
+async function rankRecallCandidatesWithGemini(session, query, candidates) {
+  const candidateLines = candidates.map((candidate, id) => {
+    const path = recallSafePath(candidate.url);
+    const visited = candidate.lastVisitTime ? relativeTime(candidate.lastVisitTime) : "visit time unknown";
+    return `${id} | ${candidate.title} | ${hostnameFor(candidate.url)}${path} | ${visited}`;
+  }).join("\n");
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["matches"],
+    properties: {
+      matches: {
+        type: "array",
+        maxItems: 5,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "reason"],
+          properties: {
+            id: { type: "integer", minimum: 0, maximum: candidates.length - 1 },
+            reason: { type: "string" }
+          }
+        }
+      }
+    }
+  };
+
+  const prompt = [
+    "You rank browser history entries for a page the user vaguely remembers.",
+    "Select only entries that plausibly match. Prefer semantic clues, topic, site, and time hints in the request.",
+    "Never invent a page or ID. If there is no plausible match, return an empty matches array.",
+    "Keep each reason concrete and under 12 words. Return JSON only.",
+    `User remembers: ${JSON.stringify(query)}`,
+    "History entries:",
+    candidateLines
+  ].join("\n\n");
+
+  let response;
+  try {
+    response = await session.prompt(prompt, { responseConstraint: schema });
+  } catch (error) {
+    if (error && error.name !== "NotSupportedError" && error.name !== "TypeError") throw error;
+    response = await session.prompt(`${prompt}\n\nReturn exactly {"matches":[{"id":0,"reason":"short reason"}]}.`);
+  }
+
+  const parsed = parseGeminiJson(response);
+  const seen = new Set();
+  return (Array.isArray(parsed.matches) ? parsed.matches : [])
+    .filter((match) => Number.isInteger(match.id) && candidates[match.id] && !seen.has(match.id))
+    .map((match) => {
+      seen.add(match.id);
+      return {
+        ...candidates[match.id],
+        reason: String(match.reason || "Matches what you remember").slice(0, 90)
+      };
+    })
+    .slice(0, 5);
+}
+
+function parseGeminiJson(value) {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  return JSON.parse(cleaned);
+}
+
+function recallSafePath(url) {
+  try {
+    const parsed = new URL(url);
+    const path = decodeURIComponent(parsed.pathname).replace(/\s+/g, " ");
+    return path === "/" ? "" : shortTitle(path, 70);
+  } catch {
+    return "";
+  }
+}
+
+function renderLocalRecallFallback(query, candidates, detail) {
+  const matches = rankRecallCandidatesLocally(query, candidates);
+  if (matches.length) {
+    renderRecallResults(matches, detail);
+    return;
+  }
+
+  renderRecallStatus({
+    icon: "0",
+    title: "No close match found",
+    detail: `${detail} Try a site name, topic, or rough time you visited it.`
+  });
+}
+
+function rankRecallCandidatesLocally(query, candidates) {
+  const normalizedQuery = normalizeRecallText(query);
+  const tokens = [...new Set(normalizedQuery.split(" ").filter((token) => token.length > 1))];
+  if (!tokens.length) return [];
+
+  return candidates
+    .map((candidate) => {
+      const title = normalizeRecallText(candidate.title);
+      const location = normalizeRecallText(`${hostnameFor(candidate.url)} ${recallSafePath(candidate.url)}`);
+      const haystack = `${title} ${location}`;
+      const matchingTokens = tokens.filter((token) => haystack.includes(token));
+      const phraseBonus = haystack.includes(normalizedQuery) ? 16 : 0;
+      const titleBonus = matchingTokens.filter((token) => title.includes(token)).length * 3;
+      const score = phraseBonus + matchingTokens.length * 4 + titleBonus;
+      return { candidate, score, matchingTokens };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || (b.candidate.lastVisitTime || 0) - (a.candidate.lastVisitTime || 0))
+    .slice(0, 5)
+    .map(({ candidate, matchingTokens }) => ({
+      ...candidate,
+      reason: matchingTokens.length
+        ? `Title or address contains ${matchingTokens.slice(0, 3).join(", ")}`
+        : "Closest direct match"
+    }));
+}
+
+function normalizeRecallText(value) {
+  return String(value || "")
+    .toLocaleLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function renderRecallResults(matches, notice = "") {
+  const content = document.querySelector("#recall-content");
+  clearChildren(content);
+
+  if (notice) {
+    const status = createRecallStatus({
+      icon: "↳",
+      title: "Local matches",
+      detail: notice
+    });
+    status.classList.add("recall-fallback-note");
+    content.append(status);
+  }
+
+  const list = document.createElement("div");
+  list.className = "recall-results";
+
+  matches.forEach((match) => {
+    const button = document.createElement("button");
+    button.className = "recall-result";
+    button.type = "button";
+    button.title = `${match.title}\n${match.url}`;
+    button.addEventListener("click", () => {
+      window.location.href = match.url;
+    });
+
+    const icon = document.createElement("span");
+    icon.className = "recall-result-icon";
+    icon.textContent = initialFor(match.title, match.url);
+
+    const img = document.createElement("img");
+    img.alt = "";
+    loadIconSources(img, match.url, 64, () => {
+      img.remove();
+    });
+    icon.append(img);
+
+    const copy = document.createElement("span");
+    copy.className = "recall-result-copy";
+
+    const title = document.createElement("span");
+    title.className = "recall-result-title";
+    title.textContent = match.title;
+
+    const meta = document.createElement("span");
+    meta.className = "recall-result-meta";
+    meta.textContent = `${hostnameFor(match.url)} · ${match.lastVisitTime ? relativeTime(match.lastVisitTime) : "In your history"}`;
+
+    const reason = document.createElement("span");
+    reason.className = "recall-result-reason";
+    reason.textContent = match.reason;
+
+    const arrow = document.createElement("span");
+    arrow.className = "recall-result-arrow";
+    arrow.textContent = "→";
+    arrow.setAttribute("aria-hidden", "true");
+
+    copy.append(title, meta, reason);
+    button.append(icon, copy, arrow);
+    list.append(button);
+  });
+
+  content.append(list);
+}
+
+function renderRecallStatus(options) {
+  const content = document.querySelector("#recall-content");
+  clearChildren(content);
+  content.append(createRecallStatus(options));
+}
+
+function createRecallStatus({ icon, title, detail, loading = false }) {
+  const status = document.createElement("div");
+  status.className = `recall-status${loading ? " is-loading" : ""}`;
+
+  const statusIcon = document.createElement("span");
+  statusIcon.className = "recall-status-icon";
+  statusIcon.textContent = icon;
+
+  const copy = document.createElement("span");
+  copy.className = "recall-status-copy";
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  const body = document.createElement("span");
+  body.textContent = detail;
+  copy.append(heading, body);
+  status.append(statusIcon, copy);
+  return status;
+}
+
+function showRecallPanel() {
+  const panel = document.querySelector("#recall-panel");
+  panel.hidden = false;
+}
+
+function hideRecallPanel() {
+  const panel = document.querySelector("#recall-panel");
+  panel.hidden = true;
+  document.querySelector("#search-input").focus();
+}
+
+function setRecallBusy(busy) {
+  const button = document.querySelector("#recall-button");
+  button.setAttribute("aria-busy", String(busy));
+}
 
 async function loadPage() {
   await Promise.all([
     renderRecentlyClosed(),
-    renderFavorites(),
-    renderSuggestions()
+    renderFavorites()
   ]);
+  await renderContinueJourneys();
 }
 
 function hasExtensionApis() {
@@ -203,8 +655,7 @@ function hasExtensionApis() {
       chrome.bookmarks &&
       chrome.history &&
       chrome.sessions &&
-      chrome.storage &&
-      chrome.topSites
+      chrome.storage
   );
 }
 
@@ -521,7 +972,7 @@ function normalizeThemeName(theme) {
 function updateSuggestionPalettes(themeName) {
   const normalized = normalizeThemeName(themeName);
   const activePalette = themePalettes[normalized] || themePalettes.classic;
-  const cards = document.querySelectorAll(".suggestion-card");
+  const cards = document.querySelectorAll(".journey-card");
   cards.forEach((card, index) => {
     const colors = activePalette[index % activePalette.length];
     if (colors) {
@@ -619,9 +1070,9 @@ function imageFileToDataUrl(file) {
   });
 }
 
-async function renderRecentlyClosed() {
+async function renderRecentlyClosed({ forceOrganize = false, allowDownload = false } = {}) {
+  const request = ++recentRenderRequest;
   const recentList = document.querySelector("#recent-list");
-  const clearButton = document.querySelector("#clear-recent");
   clearChildren(recentList);
 
   const clearedAt = await getStorageValue(STORAGE_KEY, 0);
@@ -630,50 +1081,556 @@ async function renderRecentlyClosed() {
     .then((sessions) => sessions.length ? sessions : (IS_EXTENSION_CONTEXT ? [] : fallbackRecent))
     .then((sessions) => sessions
     .filter((item) => item.lastModified > clearedAt)
-    .slice(0, MAX_RECENT));
+    .slice(0, 25));
 
-  clearButton.hidden = items.length === 0;
+  if (request !== recentRenderRequest) return;
+
+  recentItemsState = items;
+  updateRecentControls(items);
 
   if (items.length === 0) {
     renderEmptyPills(recentList);
     return;
   }
 
-  items.forEach((item) => {
-    const button = document.createElement("button");
-    button.className = "recent-pill";
-    button.type = "button";
-    button.title = item.title;
-    button.title = item.title;
-    
-    if (item.url && !item.url.startsWith("chrome://newtab")) {
-      const img = document.createElement("img");
-      img.className = "recent-pill-icon";
-      img.alt = "";
-      img.loading = "lazy";
-      loadIconSources(img, item.url, 64, () => {
-        img.hidden = true;
-      });
-      button.append(img);
-    } else {
-      const emptyIcon = document.createElement("div");
-      emptyIcon.className = "recent-pill-icon";
-      button.append(emptyIcon);
-    }
-    
-    const text = document.createElement("span");
-    text.className = "recent-pill-text";
-    text.textContent = item.title;
-    button.append(text);
-    button.addEventListener("click", () => {
-      if (IS_EXTENSION_CONTEXT && !item.sessionId.startsWith("preview-")) {
-        chrome.sessions.restore(item.sessionId);
-        return;
-      }
-      window.location.href = item.url;
+  renderRecentChronological(recentList, items.slice(0, MAX_RECENT));
+
+  if (SHOW_AI_LOADING_PREVIEW) {
+    setRecentOrganizationBusy(true, "AI is reviewing your closed tabs…");
+    return;
+  }
+
+  if (!IS_EXTENSION_CONTEXT) {
+    recentDisplayMode = "recent";
+    updateRecentControls(items);
+    setRecentOrganizationNote("Preview data");
+    return;
+  }
+
+  const organizableItems = items.filter((item) => isHttpUrl(item.url)).slice(0, MAX_RECENT_ORGANIZER_CANDIDATES);
+  if (recentDisplayMode !== "smart" || organizableItems.length < 3) return;
+
+  const fingerprint = recentOrganizationFingerprint(organizableItems);
+  const cached = await getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null);
+  const cachedGroups = hydrateRecentOrganization(cached, fingerprint, organizableItems);
+
+  if (cachedGroups.length && !forceOrganize) {
+    renderOrganizedRecent(recentList, cachedGroups, items.length);
+    return;
+  }
+
+  setRecentOrganizationBusy(true, "AI is reviewing your closed tabs…");
+  let result;
+  try {
+    result = await runRateLimitedAiTask({
+      feature: "recent",
+      fingerprint,
+      force: forceOrganize,
+      loadCached: async () => {
+        const latestCache = await getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null);
+        const groups = hydrateRecentOrganization(latestCache, fingerprint, organizableItems);
+        return groups.length ? { status: "success", groups } : null;
+      },
+      saveSuccess: (success) => setStorageValue(
+        RECENT_ORGANIZATION_CACHE_KEY,
+        serializeRecentOrganization(fingerprint, success.groups)
+      ),
+      task: () => generateRecentOrganization(organizableItems, {
+        allowDownload,
+        onStatus: (message) => setRecentOrganizationNote(message, "loading")
+      })
     });
-    recentList.append(button);
+  } catch (error) {
+    console.warn("Chrome built-in Gemini recent-tab orchestration failed", describeGeminiError(error));
+    resetBrowserOrganizerSession();
+    result = { status: "error", groups: [] };
+  }
+  if (request !== recentRenderRequest) return;
+
+  setRecentOrganizationBusy(false);
+
+  if (result.status === "success" && result.groups.length) {
+    renderOrganizedRecent(recentList, result.groups, items.length);
+    return;
+  }
+
+  if (result.status === "needs-user") {
+    recentDisplayMode = "recent";
+    updateRecentControls(items);
+    setRecentOrganizationNote("Select Organize to finish setting up on-device Gemini.");
+  } else if (result.status === "unavailable") {
+    recentDisplayMode = "recent";
+    updateRecentControls(items);
+    setRecentOrganizationNote("Gemini is unavailable here; showing recent order.");
+  } else if (result.status === "throttled") {
+    recentDisplayMode = "recent";
+    updateRecentControls(items);
+    setRecentOrganizationNote("Recent order · AI will retry when this activity changes.");
+  } else {
+    recentDisplayMode = "recent";
+    updateRecentControls(items);
+    setRecentOrganizationNote("Couldn’t organize this set; showing recent order.");
+  }
+}
+
+function renderRecentChronological(container, items) {
+  container.className = "recent-grid";
+  clearChildren(container);
+  items.forEach((item) => container.append(createRecentButton(item)));
+}
+
+function renderOrganizedRecent(container, groups, totalItemCount) {
+  container.className = "recent-grid recent-grid-organized";
+  clearChildren(container);
+
+  groups.forEach((group, groupIndex) => {
+    const section = document.createElement("section");
+    section.className = "recent-group";
+
+    const header = document.createElement("div");
+    header.className = "recent-group-header";
+
+    const label = document.createElement("h3");
+    label.textContent = group.label;
+
+    const count = document.createElement("span");
+    count.textContent = String(group.items.length);
+    count.setAttribute("aria-label", `${group.items.length} tabs`);
+
+    header.append(label, count);
+    section.append(header);
+
+    group.items.forEach((entry, itemIndex) => {
+      section.append(createRecentButton(entry.item, {
+        reason: entry.reason,
+        topPick: groupIndex === 0 && itemIndex === 0
+      }));
+    });
+    container.append(section);
   });
+
+  updateRecentControls(recentItemsState);
+  setRecentOrganizationNote(`Organized privately by AI · ${groups.reduce((sum, group) => sum + group.items.length, 0)} picks from ${totalItemCount}`, "ready");
+}
+
+function createRecentButton(item, { reason = "", topPick = false } = {}) {
+  const button = document.createElement("button");
+  button.className = `recent-pill${topPick ? " is-top-pick" : ""}`;
+  button.type = "button";
+  button.title = reason ? `${item.title}\n${reason}` : item.title;
+
+  if (item.url && !item.url.startsWith("chrome://newtab")) {
+    const img = document.createElement("img");
+    img.className = "recent-pill-icon";
+    img.alt = "";
+    img.loading = "lazy";
+    loadIconSources(img, item.url, 64, () => {
+      img.hidden = true;
+    });
+    button.append(img);
+  } else {
+    const emptyIcon = document.createElement("div");
+    emptyIcon.className = "recent-pill-icon";
+    button.append(emptyIcon);
+  }
+
+  const text = document.createElement("span");
+  text.className = "recent-pill-text";
+  text.textContent = item.title;
+  button.append(text);
+
+  if (topPick) {
+    const badge = document.createElement("span");
+    badge.className = "recent-top-pick";
+    badge.textContent = "Top pick";
+    button.append(badge);
+  }
+
+  button.addEventListener("click", () => {
+    if (IS_EXTENSION_CONTEXT && !item.sessionId.startsWith("preview-")) {
+      chrome.sessions.restore(item.sessionId);
+      return;
+    }
+    window.location.href = item.url;
+  });
+  return button;
+}
+
+function updateRecentControls(items) {
+  const clearButton = document.querySelector("#clear-recent");
+  const organizeButton = document.querySelector("#recent-organize");
+  const organizeLabel = organizeButton.querySelector("span");
+  const hasItems = items.length > 0;
+
+  clearButton.hidden = !hasItems;
+  organizeButton.hidden = items.length < 3;
+  organizeButton.setAttribute("aria-busy", "false");
+  organizeButton.setAttribute("aria-pressed", String(recentDisplayMode === "smart"));
+  organizeLabel.textContent = recentDisplayMode === "smart" ? "Recent order" : "Organize";
+  organizeButton.title = recentDisplayMode === "smart"
+    ? "Return to Chrome's chronological order"
+    : "Group and rank recently closed tabs with on-device Gemini";
+
+  if (!hasItems || recentDisplayMode === "recent") {
+    setRecentOrganizationNote("");
+  }
+}
+
+function setRecentOrganizationBusy(busy, note = "") {
+  const button = document.querySelector("#recent-organize");
+  const section = document.querySelector(".section-recent");
+  const list = document.querySelector("#recent-list");
+  button.setAttribute("aria-busy", String(busy));
+  section.classList.toggle("is-ai-working", busy);
+  list.setAttribute("aria-busy", String(busy));
+  if (busy) button.querySelector("span").textContent = "AI working";
+  if (!busy) updateRecentControls(recentItemsState);
+  if (note) setRecentOrganizationNote(note, busy ? "loading" : "");
+}
+
+function setRecentOrganizationNote(message, state = "") {
+  const note = document.querySelector("#recent-mode-note");
+  note.textContent = message;
+  note.dataset.state = state;
+  note.hidden = !message;
+}
+
+function recentOrganizationFingerprint(items) {
+  return items.map((item) => `${item.sessionId}:${item.lastModified}`).join("|");
+}
+
+function hydrateRecentOrganization(cache, fingerprint, items) {
+  if (!cache || cache.fingerprint !== fingerprint || !Array.isArray(cache.groups)) return [];
+  if (Date.now() - Number(cache.createdAt || 0) > RECENT_ORGANIZATION_CACHE_TTL) return [];
+
+  const bySessionId = new Map(items.map((item) => [item.sessionId, item]));
+  return cache.groups
+    .map((group) => ({
+      label: shortTitle(String(group.label || "Related tabs"), 28),
+      items: (Array.isArray(group.items) ? group.items : [])
+        .map((entry) => ({
+          item: bySessionId.get(entry.sessionId),
+          reason: shortTitle(String(entry.reason || "Related work"), 100)
+        }))
+        .filter((entry) => entry.item)
+        .slice(0, 3)
+    }))
+    .filter((group) => group.items.length)
+    .slice(0, 3);
+}
+
+function serializeRecentOrganization(fingerprint, groups) {
+  return {
+    fingerprint,
+    createdAt: Date.now(),
+    groups: groups.map((group) => ({
+      label: group.label,
+      items: group.items.map((entry) => ({
+        sessionId: entry.item.sessionId,
+        reason: entry.reason
+      }))
+    }))
+  };
+}
+
+async function runRateLimitedAiTask({
+  feature,
+  fingerprint,
+  force = false,
+  loadCached,
+  saveSuccess,
+  task
+}) {
+  return withBrowserAiLock(async () => {
+    if (!force && loadCached) {
+      const cachedResult = await loadCached();
+      if (cachedResult) return { ...cachedResult, source: "cache" };
+    }
+
+    const attemptState = await getStorageValue(AI_ATTEMPT_STATE_KEY, {});
+    const previous = attemptState?.[feature];
+    const now = Date.now();
+    if (!force && previous?.fingerprint === fingerprint && Number(previous.retryAt || 0) > now) {
+      return {
+        status: "throttled",
+        retryAt: Number(previous.retryAt),
+        previousStatus: previous.status || "recent-attempt"
+      };
+    }
+
+    const previousFailureCount = previous?.fingerprint === fingerprint
+      ? Number(previous.failureCount || 0)
+      : 0;
+    await writeAiAttemptState(attemptState, feature, {
+      fingerprint,
+      status: "running",
+      attemptedAt: now,
+      retryAt: now + 2 * 60 * 1000,
+      failureCount: previousFailureCount
+    });
+
+    let result;
+    try {
+      result = await task();
+    } catch (error) {
+      const failureCount = previousFailureCount + 1;
+      await writeAiAttemptState(await getStorageValue(AI_ATTEMPT_STATE_KEY, {}), feature, {
+        fingerprint,
+        status: "error",
+        attemptedAt: Date.now(),
+        retryAt: Date.now() + aiRetryDelay("error", feature, failureCount),
+        failureCount
+      });
+      throw error;
+    }
+
+    if (result.status === "success") {
+      try {
+        if (saveSuccess) await saveSuccess(result);
+        await clearAiAttemptState(feature);
+        return result;
+      } catch (error) {
+        const failureCount = previousFailureCount + 1;
+        await writeAiAttemptState(await getStorageValue(AI_ATTEMPT_STATE_KEY, {}), feature, {
+          fingerprint,
+          status: "error",
+          attemptedAt: Date.now(),
+          retryAt: Date.now() + aiRetryDelay("error", feature, failureCount),
+          failureCount
+        });
+        throw error;
+      }
+    }
+
+    const failureCount = result.status === "error" ? previousFailureCount + 1 : 0;
+    await writeAiAttemptState(await getStorageValue(AI_ATTEMPT_STATE_KEY, {}), feature, {
+      fingerprint,
+      status: result.status,
+      attemptedAt: Date.now(),
+      retryAt: Date.now() + aiRetryDelay(result.status, feature, failureCount),
+      failureCount
+    });
+    return result;
+  });
+}
+
+function withBrowserAiLock(task) {
+  if (!IS_EXTENSION_CONTEXT || !navigator.locks?.request) return task();
+  return navigator.locks.request(AI_ORGANIZER_LOCK_NAME, { mode: "exclusive" }, task);
+}
+
+function aiRetryDelay(status, feature, failureCount = 0) {
+  if (status === "empty") {
+    return feature === "continue" ? 6 * 60 * 60 * 1000 : 60 * 60 * 1000;
+  }
+  if (status === "needs-user") return 15 * 60 * 1000;
+  if (status === "unavailable") return 60 * 60 * 1000;
+  if (status === "error") {
+    const exponent = Math.max(0, Math.min(4, failureCount - 1));
+    return Math.min(2 * 60 * 60 * 1000, 5 * 60 * 1000 * (3 ** exponent));
+  }
+  return 15 * 60 * 1000;
+}
+
+async function writeAiAttemptState(currentState, feature, attempt) {
+  const nextState = currentState && typeof currentState === "object" ? { ...currentState } : {};
+  nextState[feature] = attempt;
+  await setStorageValue(AI_ATTEMPT_STATE_KEY, nextState);
+}
+
+async function clearAiAttemptState(feature) {
+  const currentState = await getStorageValue(AI_ATTEMPT_STATE_KEY, {});
+  if (!currentState || typeof currentState !== "object" || !currentState[feature]) return;
+  const nextState = { ...currentState };
+  delete nextState[feature];
+  await setStorageValue(AI_ATTEMPT_STATE_KEY, nextState);
+}
+
+function getBrowserOrganizerSession({ allowDownload, onStatus = () => {} }) {
+  if (browserOrganizerSession) {
+    return Promise.resolve({ status: "success", session: browserOrganizerSession });
+  }
+
+  if (!browserOrganizerSessionPromise) {
+    browserOrganizerSessionPromise = createBrowserOrganizerSession({ allowDownload, onStatus })
+      .then((result) => {
+        if (result.status === "success") {
+          browserOrganizerSession = result.session;
+        } else {
+          browserOrganizerSessionPromise = null;
+        }
+        return result;
+      });
+  }
+
+  return browserOrganizerSessionPromise.then((result) => {
+    if (allowDownload && result.status === "needs-user") {
+      browserOrganizerSessionPromise = null;
+      return getBrowserOrganizerSession({ allowDownload: true, onStatus });
+    }
+    return result;
+  });
+}
+
+async function createBrowserOrganizerSession({ allowDownload, onStatus }) {
+  if (!globalThis.LanguageModel || typeof LanguageModel.availability !== "function") {
+    return { status: "unavailable", session: null };
+  }
+
+  try {
+    const availability = await LanguageModel.availability(LANGUAGE_MODEL_OPTIONS);
+    if (availability === "unavailable") return { status: "unavailable", session: null };
+    if ((availability === "downloadable" || availability === "downloading") && !allowDownload) {
+      return { status: "needs-user", session: null };
+    }
+
+    const session = await LanguageModel.create({
+      ...LANGUAGE_MODEL_OPTIONS,
+      initialPrompts: [{
+        role: "system",
+        content: "You organize real browser activity into useful task groups. You never invent pages or sessions."
+      }],
+      monitor(monitor) {
+        monitor.addEventListener("downloadprogress", (event) => {
+          const progress = Math.max(0, Math.min(100, Math.round(event.loaded * 100)));
+          onStatus(progress < 100
+            ? `Downloading on-device Gemini · ${progress}%`
+            : "Loading Gemini on this device…");
+        });
+      }
+    });
+    return { status: "success", session };
+  } catch (error) {
+    console.warn("Chrome built-in Gemini organizer session failed", error);
+    return { status: "error", session: null };
+  }
+}
+
+async function generateRecentOrganization(items, { allowDownload, onStatus }) {
+  const sessionResult = await getBrowserOrganizerSession({ allowDownload, onStatus });
+  if (sessionResult.status !== "success") {
+    return { status: sessionResult.status, groups: [] };
+  }
+
+  try {
+    onStatus("AI is ranking and grouping the best tabs to resume…");
+    const groups = await runBrowserOrganizerPrompt(
+      sessionResult.session,
+      (promptSession) => rankRecentSessionsWithGemini(promptSession, items)
+    );
+    return { status: groups.length ? "success" : "empty", groups };
+  } catch (error) {
+    console.warn("Chrome built-in Gemini tab organization failed", describeGeminiError(error));
+    resetBrowserOrganizerSession();
+    return { status: "error", groups: [] };
+  }
+}
+
+function runBrowserOrganizerPrompt(baseSession, task) {
+  const run = async () => {
+    const promptSession = typeof baseSession.clone === "function"
+      ? await baseSession.clone()
+      : baseSession;
+
+    try {
+      return await task(promptSession);
+    } finally {
+      if (promptSession !== baseSession) promptSession.destroy();
+    }
+  };
+  const result = browserOrganizerPromptQueue.then(run, run);
+  browserOrganizerPromptQueue = result.catch(() => {});
+  return result;
+}
+
+function resetBrowserOrganizerSession() {
+  try {
+    browserOrganizerSession?.destroy();
+  } catch {
+    // The session may already have been invalidated by Chrome.
+  }
+  browserOrganizerSession = null;
+  browserOrganizerSessionPromise = null;
+}
+
+function describeGeminiError(error) {
+  return {
+    name: error?.name || "Error",
+    message: error?.message || String(error),
+    requested: Number.isFinite(error?.requested) ? error.requested : undefined,
+    contextWindow: Number.isFinite(error?.contextWindow) ? error.contextWindow : undefined
+  };
+}
+
+async function rankRecentSessionsWithGemini(session, items) {
+  const candidateLines = items.map((item, id) => {
+    const context = Array.isArray(item.contextTitles) && item.contextTitles.length > 1
+      ? ` | window: ${item.contextTitles.map((title) => shortTitle(title, 48)).join(" / ")}`
+      : "";
+    return `${id} | ${shortTitle(item.title, 68)} | ${hostnameFor(item.url)} | ${relativeTime(item.lastModified)}${context}`;
+  }).join("\n");
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["groups"],
+    properties: {
+      groups: {
+        type: "array",
+        maxItems: 3,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["label", "items"],
+          properties: {
+            label: { type: "string" },
+            items: {
+              type: "array",
+              maxItems: 3,
+              items: { type: "integer", minimum: 0, maximum: items.length - 1 }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const prompt = [
+    "Choose up to nine sessions the user is most likely to need again and group them into at most three active tasks.",
+    "Prioritize interrupted work such as forms, checkout, planning, documents, dashboards, and clusters of related pages, while still considering recency.",
+    "Use a short, specific 2-3 word label for each task. Order groups and items by recovery value.",
+    "Return only short task labels and IDs from the list. Do not explain the ranking. Return JSON only.",
+    'Output shape: {"groups":[{"label":"Task name","items":[0,1]}]}',
+    "Recently closed sessions:",
+    candidateLines
+  ].join("\n\n");
+
+  const response = await session.prompt(prompt, {
+    responseConstraint: schema,
+    omitResponseConstraintInput: true
+  });
+  const parsed = parseGeminiJson(response);
+  const seen = new Set();
+
+  return (Array.isArray(parsed.groups) ? parsed.groups : [])
+    .map((group) => ({
+      label: shortTitle(String(group.label || "Related tabs"), 28),
+      items: (Array.isArray(group.items) ? group.items : [])
+        .filter((id) => {
+          if (!Number.isInteger(id) || !items[id] || seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })
+        .map((id) => {
+          return {
+            item: items[id],
+            reason: `Grouped by Gemini as ${shortTitle(String(group.label || "related tabs"), 28)}`
+          };
+        })
+        .slice(0, 3)
+    }))
+    .filter((group) => group.items.length)
+    .slice(0, 3);
 }
 
 async function loadRecentlyClosed() {
@@ -691,7 +1648,8 @@ function normalizeSession(session) {
       sessionId: session.tab.sessionId,
       title,
       url,
-      lastModified: secondsToMillis(session.lastModified)
+      lastModified: secondsToMillis(session.lastModified),
+      contextTitles: [title]
     };
   }
 
@@ -707,7 +1665,11 @@ function normalizeSession(session) {
       sessionId: session.window.sessionId,
       title,
       url,
-      lastModified: secondsToMillis(session.lastModified)
+      lastModified: secondsToMillis(session.lastModified),
+      contextTitles: tabs
+        .map((tab) => readableTitle(tab.title, tab.url || tab.pendingUrl || ""))
+        .filter(Boolean)
+        .slice(0, 5)
     };
   }
 
@@ -1126,113 +2088,465 @@ async function moveFavorite(fromIndex, toIndex) {
   });
 }
 
-async function renderSuggestions() {
-  const suggestionsList = document.querySelector("#suggestions-list");
-  clearChildren(suggestionsList);
+async function renderContinueJourneys() {
+  const section = document.querySelector("#continue-section");
+  const badgeLabel = document.querySelector("#continue-badge-label");
 
-  const suggestions = await loadSuggestions();
-
-  if (suggestions.length === 0) {
-    renderEmptyCards(suggestionsList);
+  hideContinueSection();
+  if (SHOW_AI_LOADING_PREVIEW) {
+    renderContinueLoading("AI is connecting related pages into useful journeys…");
     return;
   }
 
+  if (IS_EXTENSION_CONTEXT) {
+    renderContinueLoading("AI is checking your recent activity for work worth resuming…");
+  }
+
+  const candidates = await loadContinueCandidates();
+  if (candidates.length < 2) {
+    hideContinueSection();
+    return;
+  }
+
+  if (!IS_EXTENSION_CONTEXT) {
+    renderContinueJourneyCards(previewContinueJourneys(candidates));
+    badgeLabel.textContent = "Preview data";
+    return;
+  }
+
+  const fingerprint = continueJourneyFingerprint(candidates);
+  const cached = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
+  const cachedJourneys = hydrateContinueJourneys(cached, fingerprint, candidates);
+  if (cachedJourneys.length) {
+    renderContinueJourneyCards(cachedJourneys);
+    return;
+  }
+
+  try {
+    const result = await runRateLimitedAiTask({
+      feature: "continue",
+      fingerprint,
+      loadCached: async () => {
+        const latestCache = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
+        const journeys = hydrateContinueJourneys(latestCache, fingerprint, candidates);
+        return journeys.length ? { status: "success", journeys } : null;
+      },
+      saveSuccess: (success) => setStorageValue(
+        CONTINUE_JOURNEY_CACHE_KEY,
+        serializeContinueJourneys(fingerprint, success.journeys)
+      ),
+      task: async () => {
+        const sessionResult = await getBrowserOrganizerSession({ allowDownload: false });
+        if (sessionResult.status !== "success") {
+          return { status: sessionResult.status, journeys: [] };
+        }
+
+        setContinueLoadingMessage("AI is connecting related pages into useful journeys…");
+        const journeys = await runBrowserOrganizerPrompt(
+          sessionResult.session,
+          (promptSession) => rankContinueJourneysWithGemini(promptSession, candidates)
+        );
+        return { status: journeys.length ? "success" : "empty", journeys };
+      }
+    });
+    if (result.status !== "success" || !result.journeys.length) {
+      hideContinueSection();
+      return;
+    }
+    renderContinueJourneyCards(result.journeys);
+  } catch (error) {
+    console.warn("Chrome built-in Gemini Continue grouping failed", describeGeminiError(error));
+    resetBrowserOrganizerSession();
+    hideContinueSection();
+  }
+}
+
+function renderContinueLoading(message) {
+  const section = document.querySelector("#continue-section");
+  const list = document.querySelector("#continue-list");
+  const badgeLabel = document.querySelector("#continue-badge-label");
   const currentTheme = normalizeThemeName(document.documentElement.dataset.themeName || "classic");
   const activePalette = themePalettes[currentTheme] || themePalettes.classic;
 
-  suggestions.slice(0, MAX_SUGGESTIONS).forEach((suggestion, index) => {
+  section.hidden = false;
+  section.classList.add("is-ai-working");
+  section.setAttribute("aria-busy", "true");
+  badgeLabel.textContent = "AI working on-device";
+  setContinueLoadingMessage(message);
+  clearChildren(list);
+
+  for (let index = 0; index < 3; index += 1) {
     const colors = activePalette[index % activePalette.length];
-    const card = document.createElement("button");
-    card.className = "suggestion-card";
-    card.type = "button";
+    const card = document.createElement("article");
+    card.className = "journey-card journey-card-loading";
     card.style.setProperty("--card-start", colors[0]);
     card.style.setProperty("--card-end", colors[1]);
-    card.title = `${suggestion.title}\n${suggestion.url}`;
-    card.addEventListener("click", () => {
-      window.location.href = suggestion.url;
-    });
+    card.setAttribute("aria-hidden", "true");
 
-    const media = document.createElement("span");
-    media.className = "suggestion-media";
-    media.style.setProperty("--fallback-bg", iconColorFor(suggestion.title, suggestion.url));
-
-    const img = document.createElement("img");
-    img.alt = "";
-    img.loading = "lazy";
-    loadIconSources(img, suggestion.url, 160, () => {
-      img.hidden = true;
-      media.textContent = initialFor(suggestion.title, suggestion.url);
-      media.classList.add("icon-fallback");
-    });
-
-    const body = document.createElement("span");
-    body.className = "suggestion-body";
+    const header = document.createElement("div");
+    header.className = "journey-loading-header";
+    const icons = document.createElement("span");
+    icons.className = "journey-loading-icons";
+    icons.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
+    const signal = document.createElement("span");
+    signal.className = "journey-loading-shape journey-loading-signal";
+    header.append(icons, signal);
 
     const title = document.createElement("span");
-    title.className = "suggestion-title";
-    title.textContent = shortTitle(suggestion.title || hostnameFor(suggestion.url), 28);
+    title.className = "journey-loading-shape journey-loading-title";
+    const sites = document.createElement("span");
+    sites.className = "journey-loading-shape journey-loading-sites";
+    const evidence = document.createElement("span");
+    evidence.className = "journey-loading-shape journey-loading-evidence";
+    const actions = document.createElement("div");
+    actions.className = "journey-loading-actions";
+    actions.append(document.createElement("span"), document.createElement("span"));
 
-    const domain = document.createElement("span");
-    domain.className = "suggestion-domain";
-    domain.textContent = hostnameFor(suggestion.url);
-
-    const time = document.createElement("span");
-    time.className = "suggestion-time";
-    time.textContent = suggestion.lastVisitTime
-      ? relativeTime(suggestion.lastVisitTime)
-      : "Frequently visited";
-
-    media.append(img);
-    body.append(title, domain, time);
-    card.append(media, body);
-    suggestionsList.append(card);
-  });
+    card.append(header, title, sites, evidence, actions);
+    list.append(card);
+  }
 }
 
-async function loadSuggestions() {
-  if (!IS_EXTENSION_CONTEXT) return fallbackSuggestions;
-  const historyItems = await loadHistorySuggestions();
-  if (historyItems.length) return historyItems;
-  return loadTopSiteSuggestions();
+function setContinueLoadingMessage(message) {
+  const subtitle = document.querySelector("#continue-subtitle");
+  subtitle.textContent = message;
 }
 
-async function loadHistorySuggestions() {
-  const startTime = Date.now() - HISTORY_RANGE_DAYS * 24 * 60 * 60 * 1000;
+function hideContinueSection() {
+  const section = document.querySelector("#continue-section");
+  const list = document.querySelector("#continue-list");
+  section.hidden = true;
+  section.classList.remove("is-ai-working");
+  section.setAttribute("aria-busy", "false");
+  document.querySelector("#continue-subtitle").textContent = "Ongoing journeys from your recent activity";
+  document.querySelector("#continue-badge-label").textContent = "Grouped on-device";
+  clearChildren(list);
+}
+
+async function loadContinueCandidates() {
+  if (!IS_EXTENSION_CONTEXT) return previewContinueCandidates();
+
+  const startTime = Date.now() - CONTINUE_RANGE_DAYS * 24 * 60 * 60 * 1000;
+  const excludedUrls = new Set([
+    ...favoritesState.map((item) => journeyUrlKey(item.url)),
+    ...recentItemsState.map((item) => journeyUrlKey(item.url))
+  ].filter(Boolean));
   const history = await callChrome(chrome.history.search, {
     text: "",
     startTime,
-    maxResults: 80
+    maxResults: 250
   });
 
-  const byHost = new Map();
-
+  const byUrl = new Map();
   history
     .filter((item) => item.url && isHttpUrl(item.url))
-    .filter((item) => !isSearchOrInternalPage(item.url))
-    .sort((a, b) => (b.lastVisitTime || 0) - (a.lastVisitTime || 0))
+    .filter((item) => !isSearchOrInternalPage(item.url) && !isSearchResultsUrl(item.url))
+    .sort((a, b) => {
+      const scoreA = (a.visitCount || 0) + (a.typedCount || 0) * 2;
+      const scoreB = (b.visitCount || 0) + (b.typedCount || 0) * 2;
+      return scoreB - scoreA || (b.lastVisitTime || 0) - (a.lastVisitTime || 0);
+    })
     .forEach((item) => {
-      const host = hostnameFor(item.url);
-      if (!host || byHost.has(host)) return;
-      byHost.set(host, {
-        title: readableTitle(item.title, item.url),
-        url: item.url,
-        lastVisitTime: item.lastVisitTime || 0
-      });
+      const key = journeyUrlKey(item.url);
+      if (!key || excludedUrls.has(key) || byUrl.has(key)) return;
+      byUrl.set(key, item);
     });
 
-  return [...byHost.values()];
+  const detailed = await Promise.all([...byUrl.values()].slice(0, 36).map(async (item) => {
+    const visits = await callChrome(chrome.history.getVisits, { url: item.url });
+    const recentVisits = visits
+      .map((visit) => Number(visit.visitTime || 0))
+      .filter((visitTime) => visitTime >= startTime);
+    const visitDays = [...new Set(recentVisits.map(dayKeyForTimestamp))];
+    const lastVisitTime = Math.max(item.lastVisitTime || 0, ...recentVisits, 0);
+
+    return {
+      title: readableTitle(item.title, item.url),
+      url: item.url,
+      lastVisitTime,
+      visitCount: recentVisits.length,
+      typedCount: item.typedCount || 0,
+      visitDays
+    };
+  }));
+
+  return detailed
+    .filter((item) => item.visitCount >= 2 && item.visitDays.length >= 2)
+    .map((item) => ({
+      ...item,
+      score: item.visitDays.length * 5
+        + Math.min(item.visitCount, 12)
+        + Math.min(item.typedCount, 5) * 2
+        + Math.max(0, 5 - Math.floor((Date.now() - item.lastVisitTime) / (7 * 24 * 60 * 60 * 1000)))
+    }))
+    .sort((a, b) => b.score - a.score || b.lastVisitTime - a.lastVisitTime)
+    .slice(0, MAX_CONTINUE_CANDIDATES);
 }
 
-async function loadTopSiteSuggestions() {
-  const topSites = await callChrome(chrome.topSites.get);
-  return topSites
-    .filter((site) => site.url && isHttpUrl(site.url))
-    .filter((site) => !isSearchOrInternalPage(site.url))
-    .map((site) => ({
-      title: readableTitle(site.title, site.url),
-      url: site.url,
-      lastVisitTime: 0
-    }));
+function previewContinueCandidates() {
+  const now = PREVIEW_TIMESTAMP;
+  const excludedUrls = new Set([
+    ...favoritesState.map((item) => journeyUrlKey(item.url)),
+    ...recentItemsState.map((item) => journeyUrlKey(item.url))
+  ].filter(Boolean));
+  return fallbackSuggestions.filter((item) => !excludedUrls.has(journeyUrlKey(item.url))).map((item, index) => {
+    const visitCount = Math.max(2, 7 - index);
+    const activeDays = Math.max(2, Math.min(5, visitCount - 1));
+    return {
+      ...item,
+      lastVisitTime: now - (index + 1) * 24 * 60 * 60 * 1000,
+      visitCount,
+      typedCount: index % 2,
+      visitDays: Array.from({ length: activeDays }, (_, day) => dayKeyForTimestamp(now - (day + index + 1) * 24 * 60 * 60 * 1000)),
+      score: activeDays * 5 + visitCount
+    };
+  });
+}
+
+function previewContinueJourneys(candidates) {
+  const previewGroups = [
+    {
+      label: "Plan reward travel",
+      hosts: new Set(["seats.aero", "point.me", "lonelyplanet.com"])
+    },
+    {
+      label: "Compare card rewards",
+      hosts: new Set(["global.americanexpress.com", "uscreditcardguide.com"])
+    }
+  ].map((group) => ({
+    label: group.label,
+    items: candidates.filter((item) => group.hosts.has(hostnameFor(item.url))).slice(0, 4)
+  })).filter((group) => group.items.length >= 2);
+
+  return previewGroups.length
+    ? previewGroups
+    : [{ label: "Ongoing research", items: candidates.slice(0, 4) }];
+}
+
+async function rankContinueJourneysWithGemini(session, candidates) {
+  const candidateLines = candidates.map((item, id) => (
+    `${id} | ${shortTitle(item.title, 68)} | ${hostnameFor(item.url)}${recallSafePath(item.url)} | ${item.visitCount} visits | ${item.visitDays.length} days | ${relativeTime(item.lastVisitTime)}`
+  )).join("\n");
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["journeys"],
+    properties: {
+      journeys: {
+        type: "array",
+        maxItems: 3,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["label", "items"],
+          properties: {
+            label: { type: "string" },
+            items: {
+              type: "array",
+              maxItems: 4,
+              items: { type: "integer", minimum: 0, maximum: candidates.length - 1 }
+            }
+          }
+        }
+      }
+    }
+  };
+  const prompt = [
+    "Find up to three concrete ongoing user journeys from repeated browser activity across recent days.",
+    "A journey must contain at least two pages that support the same specific real-world goal or project.",
+    "Do not group pages merely because they are popular, recent, or in a broad category. Omit weak or unrelated activity.",
+    "Use specific 2-3 word labels. Rank journeys by strength of repeat activity and usefulness to continue now.",
+    "Return only labels and IDs from the list. Return JSON only.",
+    'Output shape: {"journeys":[{"label":"Project name","items":[0,1]}]}',
+    "Eligible repeat activity:",
+    candidateLines
+  ].join("\n\n");
+  const response = await session.prompt(prompt, {
+    responseConstraint: schema,
+    omitResponseConstraintInput: true
+  });
+  const parsed = parseGeminiJson(response);
+  const seen = new Set();
+
+  return (Array.isArray(parsed.journeys) ? parsed.journeys : [])
+    .reduce((result, journey) => {
+      if (result.length >= 3) return result;
+      const ids = [...new Set(Array.isArray(journey.items) ? journey.items : [])]
+        .filter((id) => Number.isInteger(id) && candidates[id] && !seen.has(id))
+        .slice(0, 4);
+      if (ids.length < 2) return result;
+      ids.forEach((id) => seen.add(id));
+      result.push({
+        label: shortTitle(String(journey.label || "Ongoing project"), 30),
+        items: ids.map((id) => candidates[id])
+      });
+      return result;
+    }, []);
+}
+
+function continueJourneyFingerprint(candidates) {
+  return candidates.map((item) => (
+    `${journeyUrlKey(item.url)}:${item.visitCount}:${item.visitDays.length}:${item.lastVisitTime}`
+  )).join("|");
+}
+
+function hydrateContinueJourneys(cache, fingerprint, candidates) {
+  if (!cache || cache.fingerprint !== fingerprint || !Array.isArray(cache.journeys)) return [];
+  if (Date.now() - Number(cache.createdAt || 0) > CONTINUE_JOURNEY_CACHE_TTL) return [];
+
+  const byUrl = new Map(candidates.map((item) => [journeyUrlKey(item.url), item]));
+  return cache.journeys
+    .map((journey) => ({
+      label: shortTitle(String(journey.label || "Ongoing project"), 30),
+      items: (Array.isArray(journey.urls) ? journey.urls : [])
+        .map((url) => byUrl.get(journeyUrlKey(url)))
+        .filter(Boolean)
+        .slice(0, 4)
+    }))
+    .filter((journey) => journey.items.length >= 2)
+    .slice(0, 3);
+}
+
+function serializeContinueJourneys(fingerprint, journeys) {
+  return {
+    fingerprint,
+    createdAt: Date.now(),
+    journeys: journeys.map((journey) => ({
+      label: journey.label,
+      urls: journey.items.map((item) => item.url)
+    }))
+  };
+}
+
+function renderContinueJourneyCards(journeys) {
+  const section = document.querySelector("#continue-section");
+  const list = document.querySelector("#continue-list");
+  const subtitle = document.querySelector("#continue-subtitle");
+  const badgeLabel = document.querySelector("#continue-badge-label");
+  const currentTheme = normalizeThemeName(document.documentElement.dataset.themeName || "classic");
+  const activePalette = themePalettes[currentTheme] || themePalettes.classic;
+  section.classList.remove("is-ai-working");
+  section.setAttribute("aria-busy", "false");
+  subtitle.textContent = "Ongoing journeys from your recent activity";
+  badgeLabel.textContent = "Grouped on-device";
+  clearChildren(list);
+
+  journeys.forEach((journey, index) => {
+    const colors = activePalette[index % activePalette.length];
+    const card = document.createElement("article");
+    card.className = "journey-card";
+    card.style.setProperty("--card-start", colors[0]);
+    card.style.setProperty("--card-end", colors[1]);
+
+    const header = document.createElement("div");
+    header.className = "journey-card-header";
+    const icons = createJourneyIconStack(journey.items);
+    const signal = document.createElement("span");
+    signal.className = "journey-signal";
+    signal.textContent = "Ongoing";
+    header.append(icons, signal);
+
+    const title = document.createElement("h3");
+    title.textContent = journey.label;
+    const sites = document.createElement("p");
+    sites.className = "journey-sites";
+    sites.textContent = [...new Set(journey.items.map((item) => hostnameFor(item.url)))].slice(0, 3).join(" · ");
+
+    const activeDays = new Set(journey.items.flatMap((item) => item.visitDays)).size;
+    const visits = journey.items.reduce((sum, item) => sum + item.visitCount, 0);
+    const evidence = document.createElement("p");
+    evidence.className = "journey-evidence";
+    evidence.textContent = `${visits} visits across ${activeDays} active days`;
+
+    const actions = document.createElement("div");
+    actions.className = "journey-actions";
+    const continueButton = document.createElement("button");
+    continueButton.className = "journey-continue";
+    continueButton.type = "button";
+    continueButton.textContent = "Continue";
+    continueButton.addEventListener("click", () => {
+      window.location.href = journey.items[0].url;
+    });
+
+    const arrow = document.createElement("span");
+    arrow.textContent = "→";
+    arrow.setAttribute("aria-hidden", "true");
+    continueButton.append(arrow);
+    actions.append(continueButton);
+
+    if (journey.items.length > 1) {
+      const openAll = document.createElement("button");
+      openAll.className = "journey-open-all";
+      openAll.type = "button";
+      openAll.textContent = `Open ${journey.items.length}`;
+      openAll.setAttribute("aria-label", `Open all ${journey.items.length} pages in ${journey.label}`);
+      openAll.addEventListener("click", () => openJourneyPages(journey.items));
+      actions.append(openAll);
+    }
+
+    card.append(header, title, sites, evidence, actions);
+    list.append(card);
+  });
+
+  section.hidden = false;
+}
+
+function createJourneyIconStack(items) {
+  const stack = document.createElement("div");
+  stack.className = "journey-icon-stack";
+  items.slice(0, 3).forEach((item) => {
+    const icon = document.createElement("span");
+    icon.className = "journey-icon";
+    icon.textContent = initialFor(item.title, item.url);
+    icon.style.setProperty("--fallback-bg", iconColorFor(item.title, item.url));
+    const img = document.createElement("img");
+    img.alt = "";
+    img.loading = "lazy";
+    loadIconSources(img, item.url, 64, () => img.remove());
+    icon.append(img);
+    stack.append(icon);
+  });
+  return stack;
+}
+
+function openJourneyPages(items) {
+  if (!IS_EXTENSION_CONTEXT) {
+    window.location.href = items[0].url;
+    return;
+  }
+  items.forEach((item, index) => {
+    chrome.tabs.create({ url: item.url, active: index === 0 });
+  });
+}
+
+function journeyUrlKey(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "gclid", "fbclid"].forEach((key) => {
+      parsed.searchParams.delete(key);
+    });
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function isSearchResultsUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^www\./, "");
+    return (host.endsWith("google.com") && parsed.pathname === "/search")
+      || (host === "bing.com" && parsed.pathname === "/search")
+      || (host === "search.yahoo.com")
+      || (host === "duckduckgo.com" && parsed.searchParams.has("q"));
+  } catch {
+    return true;
+  }
+}
+
+function dayKeyForTimestamp(timestamp) {
+  return new Date(timestamp).toISOString().slice(0, 10);
 }
 
 function renderEmptyPills(container) {
@@ -1249,14 +2563,6 @@ function renderEmptyTiles(container) {
     tile.className = "favorite-item favorite-item-empty";
     tile.append(document.createElement("span"), document.createElement("span"));
     container.append(tile);
-  }
-}
-
-function renderEmptyCards(container) {
-  for (let index = 0; index < 4; index += 1) {
-    const card = document.createElement("span");
-    card.className = "suggestion-card suggestion-card-empty";
-    container.append(card);
   }
 }
 
@@ -1497,6 +2803,10 @@ async function probeAndApplyIconSources(img, pageUrl, size, onFailure) {
 }
 
 function iconSources(pageUrl, size) {
+  if (!isHttpUrl(pageUrl)) {
+    return IS_EXTENSION_CONTEXT ? [chromeFaviconUrl(pageUrl, size)] : [];
+  }
+
   const host = hostnameFor(pageUrl);
   const highResolutionCandidates = [
     siteIconUrl(pageUrl, "apple-touch-icon.png"),
@@ -1531,6 +2841,7 @@ function iconSources(pageUrl, size) {
 function siteIconUrl(pageUrl, fileName) {
   try {
     const parsed = new URL(pageUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
     return `${parsed.origin}/${fileName}`;
   } catch {
     return "";

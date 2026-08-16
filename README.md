@@ -33,8 +33,10 @@ https://<github-username>.github.io/<repository-name>/
 ## Data Sources
 
 - Recently Closed Tabs: Chrome Sessions API, with the Tabs permission so Chrome exposes tab titles and URLs
+- Smart Recent Tabs: when Gemini is already available, the new tab page ranks up to 18 eligible recoverable web sessions, selects the most useful nine, and groups them into active tasks. It never starts a background model download. Fingerprinted results are cached locally for six hours, duplicate work is serialized across new tabs, and users can always switch back to chronological order.
 - Favorites: Chrome Bookmarks Bar in mirror mode. Direct URL bookmarks are shown; folders are skipped. Add, edit, remove, and reorder actions update real Chrome bookmarks.
-- Suggestions: Chrome History API, with Top Sites fallback
+- Continue: repeat activity across multiple days from the last 30 days, excluding exact Favorite and Recently Closed URLs. When Gemini is already available, it groups only strong related activity into up to three ongoing journeys. Fingerprinted results are cached for 12 hours; empty results, unavailable-model states, and failures use cooldowns with exponential backoff. Weak or unsupported results keep the section hidden.
+- Recall: Chrome's built-in Prompt API (Gemini Nano) semantically ranks real pages from up to 180 days of local history when the user explicitly selects Recall. Page titles and URL paths are processed on-device; generated URLs are never accepted. If Gemini is unavailable, Recall falls back to literal local title and address matching.
 - Favicons: high-resolution Apple touch, PWA, SVG, and root icon candidates first, then geticon.dev, Google, DuckDuckGo, and Chrome's built-in `_favicon` endpoint as fallbacks. The chosen icon is cached per domain for 14 days and can be refreshed from a favorite's right-click menu.
 - Backgrounds: user image URL, local image upload, or random no-key Picsum photo
 - Appearance: System, Light, and Dark modes stored locally
@@ -45,3 +47,7 @@ https://<github-username>.github.io/<repository-name>/
 The Clear All control hides the current recently closed list locally. Chrome does not expose an extension API for deleting recently closed session entries from Chrome itself.
 
 When `newtab.html` is opened directly as a file for visual debugging, Chrome extension APIs are not available, so the page renders preview data. Loaded as an unpacked extension, it uses the real Chrome APIs listed above.
+
+## Built-in Gemini requirements
+
+Recall, Smart Recent Tabs, and Continue use Chrome's built-in `LanguageModel` Prompt API. They require a supported desktop version of Chrome and compatible hardware. Chrome may download Gemini Nano after the user explicitly chooses an AI feature; the UI reports that progress. No API key, cloud AI service, extra extension permission, or Safarian server is used.
