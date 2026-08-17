@@ -9,7 +9,7 @@ const ICON_CACHE_KEY = "faviconCache";
 const RECENT_ORGANIZATION_CACHE_KEY = "recentClosedOrganization";
 const CONTINUE_JOURNEY_CACHE_KEY = "continueJourneys";
 const AI_ATTEMPT_STATE_KEY = "browserAiAttemptState";
-const CLOUD_AI_SESSION_KEY = "geminiCloudSession";
+const CLOUD_AI_CONFIG_KEY = "geminiCloudConfig";
 const AI_ORGANIZER_LOCK_NAME = "safarian-browser-ai-organizer";
 const RECENT_CLOUD_MODEL = "gemini-3.5-flash-lite";
 const CONTINUE_CLOUD_MODEL = "gemini-3.7-flash";
@@ -49,10 +49,13 @@ let iconCachePromise = null;
 let recentDisplayMode = "smart";
 let recentItemsState = [];
 let recentRenderRequest = 0;
+let recentNanoDownloadIntent = null;
+let continueRenderRequest = 0;
 let browserOrganizerSession = null;
 let browserOrganizerSessionPromise = null;
 let browserOrganizerPromptQueue = Promise.resolve();
-const volatileSessionStorage = new Map();
+let trustedLocalStoragePromise = null;
+let volatileCloudAiConfig = null;
 
 const themePalettes = {
   classic: [
@@ -205,13 +208,20 @@ document.addEventListener("DOMContentLoaded", () => {
 
   recentOrganizeButton.addEventListener("click", async () => {
     if (recentDisplayMode === "smart") {
+      recentNanoDownloadIntent = null;
       recentDisplayMode = "recent";
       await renderRecentlyClosed();
       return;
     }
 
     recentDisplayMode = "smart";
-    await renderRecentlyClosed({ forceOrganize: true, allowDownload: true });
+    const downloadIntent = {};
+    recentNanoDownloadIntent = downloadIntent;
+    try {
+      await renderRecentlyClosed({ forceOrganize: true, downloadIntent });
+    } finally {
+      if (recentNanoDownloadIntent === downloadIntent) recentNanoDownloadIntent = null;
+    }
   });
 
   searchForm.addEventListener("submit", (event) => {
@@ -647,6 +657,9 @@ function setRecallBusy(busy) {
 }
 
 async function loadPage() {
+  if (IS_EXTENSION_CONTEXT) {
+    renderContinueLoading("Preparing useful journeys from your recent activity…", "pending");
+  }
   await Promise.all([
     renderRecentlyClosed(),
     renderFavorites()
@@ -770,21 +783,21 @@ async function setupCloudAiControls() {
   const replaceButton = document.querySelector("#cloud-ai-replace");
   const forgetButton = document.querySelector("#cloud-ai-forget");
   let isReplacing = false;
-  let config = await getCloudAiSessionConfig({ includeDisabled: true });
+  let config = await getCloudAiConfig({ includeDisabled: true });
 
   renderCloudAiControls(config?.enabled ? "cloud" : "local", config);
 
   providerButtons.forEach((button) => {
     button.addEventListener("click", async () => {
       const provider = button.dataset.aiProvider;
-      config = await getCloudAiSessionConfig({ includeDisabled: true });
+      config = await getCloudAiConfig({ includeDisabled: true });
 
       if (provider === "local") {
         isReplacing = false;
         if (config) {
           config = { ...config, enabled: false };
           try {
-            await setSessionStorageValue(CLOUD_AI_SESSION_KEY, config);
+            await setCloudAiConfigValue(config);
           } catch (error) {
             setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
             return;
@@ -800,7 +813,7 @@ async function setupCloudAiControls() {
         isReplacing = false;
         config = { ...config, enabled: true };
         try {
-          await setSessionStorageValue(CLOUD_AI_SESSION_KEY, config);
+          await setCloudAiConfigValue(config);
         } catch (error) {
           setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
           return;
@@ -855,31 +868,31 @@ async function setupCloudAiControls() {
         routingVersion: 2,
         connectedAt: Date.now()
       };
-      await setSessionStorageValue(CLOUD_AI_SESSION_KEY, nextConfig);
-      const savedConfig = await getCloudAiSessionConfig({ includeDisabled: true });
+      await setCloudAiConfigValue(nextConfig);
+      const savedConfig = await getCloudAiConfig({ includeDisabled: true });
       if (!savedConfig || savedConfig.keyId !== nextConfig.keyId) {
-        const storageError = new Error("Chrome did not retain the session-only Gemini key");
-        storageError.name = "SessionStorageError";
+        const storageError = new Error("Chrome did not retain the device-local Gemini key");
+        storageError.name = "PersistentStorageError";
         throw storageError;
       }
       config = savedConfig;
       isReplacing = false;
       keyInput.value = "";
       renderCloudAiControls("cloud", config);
-      setCloudAiStatus("Connected. Flash-Lite handles Recent; 3.7 Flash handles Continue.", "ready");
+      setCloudAiStatus("Connected and remembered on this device. Flash-Lite handles Recent; 3.7 Flash handles Continue.", "ready");
       await refreshAiSectionsForProviderChange();
     } catch (error) {
       setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
     } finally {
       connectButton.disabled = false;
       connectButton.setAttribute("aria-busy", "false");
-      connectButton.textContent = isReplacing ? "Test & replace key" : "Test & use Flash";
+      connectButton.textContent = isReplacing ? "Test & replace key" : "Test & remember key";
     }
   });
 
   forgetButton.addEventListener("click", async () => {
     try {
-      await setSessionStorageValue(CLOUD_AI_SESSION_KEY, null);
+      await setCloudAiConfigValue(null);
     } catch (error) {
       setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
       return;
@@ -933,8 +946,8 @@ function setCloudAiStatus(message, state = "") {
 }
 
 function cloudAiSetupErrorMessage(error) {
-  if (error?.name === "SessionStorageError") {
-    return "Chrome couldn’t retain this session-only key. Reload the extension and try again.";
+  if (error?.name === "PersistentStorageError") {
+    return "Chrome couldn’t retain this key in device-local extension storage. Try again or use on-device AI.";
   }
   if (error?.name === "TimeoutError") return "Gemini took too long to respond. Check your connection and try again.";
   if (error?.reason === "API_KEY_INVALID" || error?.status === 401 || error?.status === 403) {
@@ -946,6 +959,8 @@ function cloudAiSetupErrorMessage(error) {
 
 async function refreshAiSectionsForProviderChange() {
   recentDisplayMode = "smart";
+  continueRenderRequest += 1;
+  renderContinueLoading("Switching Continue to your selected AI engine…", "pending");
   await renderRecentlyClosed();
   await renderContinueJourneys();
 }
@@ -1266,8 +1281,13 @@ function imageFileToDataUrl(file) {
   });
 }
 
-async function renderRecentlyClosed({ forceOrganize = false, allowDownload = false } = {}) {
+async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = null } = {}) {
   const request = ++recentRenderRequest;
+  const allowDownload = Boolean(
+    forceOrganize &&
+    downloadIntent &&
+    downloadIntent === recentNanoDownloadIntent
+  );
   const recentList = document.querySelector("#recent-list");
   clearChildren(recentList);
 
@@ -1306,7 +1326,7 @@ async function renderRecentlyClosed({ forceOrganize = false, allowDownload = fal
   const organizableItems = items.filter((item) => isHttpUrl(item.url)).slice(0, MAX_RECENT_ORGANIZER_CANDIDATES);
   if (recentDisplayMode !== "smart" || organizableItems.length < 3) return;
 
-  const cloudConfig = await getCloudAiSessionConfig();
+  const cloudConfig = await getCloudAiConfig();
   const fingerprint = recentOrganizationFingerprint(
     organizableItems,
     aiProviderCacheKey(cloudConfig, RECENT_CLOUD_MODEL)
@@ -1423,31 +1443,55 @@ function createRecentButton(item, { reason = "", topPick = false } = {}) {
   button.type = "button";
   button.title = reason ? `${item.title}\n${reason}` : item.title;
 
+  const iconWrap = document.createElement("div");
+  iconWrap.className = "recent-pill-icon-wrap";
+
   if (item.url && !item.url.startsWith("chrome://newtab")) {
     const img = document.createElement("img");
     img.className = "recent-pill-icon";
     img.alt = "";
     img.loading = "lazy";
     loadIconSources(img, item.url, 64, () => {
-      img.hidden = true;
+      img.remove();
+      iconWrap.textContent = initialFor(item.title, item.url);
+      iconWrap.style.setProperty("--fallback-bg", iconColorFor(item.title, item.url));
+      iconWrap.classList.add("icon-fallback");
     });
-    button.append(img);
+    iconWrap.append(img);
   } else {
-    const emptyIcon = document.createElement("div");
-    emptyIcon.className = "recent-pill-icon";
-    button.append(emptyIcon);
+    iconWrap.textContent = initialFor(item.title, item.url);
+    iconWrap.style.setProperty("--fallback-bg", iconColorFor(item.title, item.url));
+    iconWrap.classList.add("icon-fallback");
   }
+  button.append(iconWrap);
 
-  const text = document.createElement("span");
-  text.className = "recent-pill-text";
-  text.textContent = item.title;
-  button.append(text);
+  const content = document.createElement("div");
+  content.className = "recent-pill-content";
+
+  const title = document.createElement("span");
+  title.className = "recent-pill-title";
+  title.textContent = readableTitle(item.title, item.url) || hostnameFor(item.url) || "Closed Tab";
+
+  const meta = document.createElement("span");
+  meta.className = "recent-pill-meta";
+  const host = hostnameFor(item.url);
+  const time = item.lastModified ? relativeTime(item.lastModified) : "";
+  meta.textContent = reason ? reason : (host ? (time ? `${host} · ${time}` : host) : time);
+
+  content.append(title, meta);
+  button.append(content);
 
   if (topPick) {
     const badge = document.createElement("span");
     badge.className = "recent-top-pick";
-    badge.textContent = "Top pick";
+    badge.innerHTML = `<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path></svg><span>Top pick</span>`;
     button.append(badge);
+  } else {
+    const arrow = document.createElement("span");
+    arrow.className = "recent-pill-arrow";
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.innerHTML = `<svg viewBox="0 0 24 24" focusable="false"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
+    button.append(arrow);
   }
 
   button.addEventListener("click", () => {
@@ -1557,7 +1601,12 @@ async function runRateLimitedAiTask({
     const attemptState = await getStorageValue(AI_ATTEMPT_STATE_KEY, {});
     const previous = attemptState?.[feature];
     const now = Date.now();
-    if (!force && previous?.fingerprint === fingerprint && Number(previous.retryAt || 0) > now) {
+    if (
+      !force &&
+      previous?.status !== "running" &&
+      previous?.fingerprint === fingerprint &&
+      Number(previous.retryAt || 0) > now
+    ) {
       return {
         status: "throttled",
         retryAt: Number(previous.retryAt),
@@ -1690,6 +1739,7 @@ async function createBrowserOrganizerSession({ allowDownload, onStatus }) {
     if ((availability === "downloadable" || availability === "downloading") && !allowDownload) {
       return { status: "needs-user", session: null };
     }
+    const isModelDownload = availability === "downloadable" || availability === "downloading";
 
     const session = await LanguageModel.create({
       ...LANGUAGE_MODEL_OPTIONS,
@@ -1700,9 +1750,11 @@ async function createBrowserOrganizerSession({ allowDownload, onStatus }) {
       monitor(monitor) {
         monitor.addEventListener("downloadprogress", (event) => {
           const progress = Math.max(0, Math.min(100, Math.round(event.loaded * 100)));
-          onStatus(progress < 100
-            ? `Downloading on-device Gemini · ${progress}%`
-            : "Loading Gemini on this device…");
+          onStatus(isModelDownload
+            ? (progress < 100
+              ? `Downloading on-device Gemini · ${progress}%`
+              : "Finishing the on-device Gemini download…")
+            : "Loading the available on-device Gemini model…");
         });
       }
     });
@@ -1846,8 +1898,8 @@ async function promptGeminiFlash(apiKey, model, prompt, schema, maxOutputTokens 
   }
 }
 
-async function getCloudAiSessionConfig({ includeDisabled = false } = {}) {
-  const config = await getSessionStorageValue(CLOUD_AI_SESSION_KEY, null);
+async function getCloudAiConfig({ includeDisabled = false } = {}) {
+  const config = await getCloudAiConfigValue();
   if (!config || typeof config.apiKey !== "string" || !config.apiKey.trim() || !config.keyId) return null;
   if (!includeDisabled && config.enabled !== true) return null;
   return config;
@@ -2420,15 +2472,17 @@ async function moveFavorite(fromIndex, toIndex) {
 }
 
 async function renderContinueJourneys({ force = false } = {}) {
-  const section = document.querySelector("#continue-section");
+  const request = ++continueRenderRequest;
   const badgeLabel = document.querySelector("#continue-badge-label");
-  const cloudConfig = IS_EXTENSION_CONTEXT ? await getCloudAiSessionConfig() : null;
+  renderContinueLoading("Preparing useful journeys from your recent activity…", "pending");
 
-  hideContinueSection();
   if (SHOW_AI_LOADING_PREVIEW) {
-    renderContinueLoading("AI is connecting related pages into useful journeys…");
+    setContinueLoadingMessage("AI is connecting related pages into useful journeys…");
     return;
   }
+
+  const cloudConfig = IS_EXTENSION_CONTEXT ? await getCloudAiConfig() : null;
+  if (request !== continueRenderRequest) return;
 
   if (IS_EXTENSION_CONTEXT) {
     renderContinueLoading(
@@ -2440,8 +2494,12 @@ async function renderContinueJourneys({ force = false } = {}) {
   }
 
   const candidates = await loadContinueCandidates();
+  if (request !== continueRenderRequest) return;
   if (candidates.length < 2) {
-    hideContinueSection();
+    renderContinueEmpty(
+      "No strong journey yet. Revisit related pages across a few days and Safarian will surface them here.",
+      "Waiting for activity"
+    );
     return;
   }
 
@@ -2456,6 +2514,7 @@ async function renderContinueJourneys({ force = false } = {}) {
     aiProviderCacheKey(cloudConfig, CONTINUE_CLOUD_MODEL)
   );
   const cached = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
+  if (request !== continueRenderRequest) return;
   const cachedJourneys = hydrateContinueJourneys(cached, fingerprint, candidates);
   if (cachedJourneys.length && !force) {
     renderContinueJourneyCards(cachedJourneys, cached.provider || "local");
@@ -2481,16 +2540,45 @@ async function renderContinueJourneys({ force = false } = {}) {
         onStatus: setContinueLoadingMessage
       })
     });
+    if (request !== continueRenderRequest) return;
     if (result.status !== "success" || !result.journeys.length) {
-      hideContinueSection();
+      renderContinueEmpty(continueEmptyMessage(result), continueEmptyBadge(result));
       return;
     }
     renderContinueJourneyCards(result.journeys, result.provider || "local");
   } catch (error) {
     console.warn("Gemini Continue grouping failed", describeGeminiError(error));
     resetBrowserOrganizerSession();
-    hideContinueSection();
+    if (request !== continueRenderRequest) return;
+    renderContinueEmpty(
+      "Continue couldn’t refresh this time. Safarian will try again automatically.",
+      "Retrying later"
+    );
   }
+}
+
+function continueEmptyMessage(result) {
+  if (result?.status === "needs-user") {
+    return "On-device Gemini isn’t ready. Enable Gemini Flash in Customize or keep browsing and Safarian will retry later.";
+  }
+  if (result?.status === "unavailable") {
+    return "AI grouping isn’t available right now. Safarian will keep your activity private and try again when it becomes available.";
+  }
+  if (result?.status === "throttled") {
+    return result.previousStatus === "empty"
+      ? "No strong journey was found in this activity yet. Safarian will check again when it changes."
+      : "Continue is cooling down after a temporary AI issue and will retry automatically.";
+  }
+  if (result?.status === "empty") {
+    return "No strong multi-page journey was found yet. Safarian will check again as your activity develops.";
+  }
+  return "Continue couldn’t refresh this time. Safarian will try again automatically.";
+}
+
+function continueEmptyBadge(result) {
+  if (result?.status === "empty" || result?.previousStatus === "empty") return "Waiting for signal";
+  if (result?.status === "needs-user") return "AI not ready";
+  return "Retrying later";
 }
 
 function renderContinueLoading(message, provider = "local") {
@@ -2503,7 +2591,11 @@ function renderContinueLoading(message, provider = "local") {
   section.hidden = false;
   section.classList.add("is-ai-working");
   section.setAttribute("aria-busy", "true");
-  badgeLabel.textContent = provider === "cloud" ? "Gemini Flash working" : "AI working on-device";
+  badgeLabel.textContent = provider === "cloud"
+    ? "Gemini Flash working"
+    : provider === "local"
+      ? "AI working on-device"
+      : "AI preparing";
   setContinueLoadingMessage(message);
   clearChildren(list);
 
@@ -2516,25 +2608,46 @@ function renderContinueLoading(message, provider = "local") {
     card.setAttribute("aria-hidden", "true");
 
     const header = document.createElement("div");
-    header.className = "journey-loading-header";
-    const icons = document.createElement("span");
-    icons.className = "journey-loading-icons";
-    icons.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
-    const signal = document.createElement("span");
-    signal.className = "journey-loading-shape journey-loading-signal";
-    header.append(icons, signal);
+    header.className = "journey-card-header";
+    const badge = document.createElement("span");
+    badge.className = "journey-loading-shape journey-loading-badge";
+    const count = document.createElement("span");
+    count.className = "journey-loading-shape journey-loading-count";
+    header.append(badge, count);
 
+    const heading = document.createElement("div");
+    heading.className = "journey-card-heading";
     const title = document.createElement("span");
     title.className = "journey-loading-shape journey-loading-title";
-    const sites = document.createElement("span");
-    sites.className = "journey-loading-shape journey-loading-sites";
-    const evidence = document.createElement("span");
-    evidence.className = "journey-loading-shape journey-loading-evidence";
-    const actions = document.createElement("div");
-    actions.className = "journey-loading-actions";
-    actions.append(document.createElement("span"), document.createElement("span"));
+    const stats = document.createElement("span");
+    stats.className = "journey-loading-shape journey-loading-stats";
+    heading.append(title, stats);
 
-    card.append(header, title, sites, evidence, actions);
+    const pagesList = document.createElement("div");
+    pagesList.className = "journey-pages-list";
+    for (let r = 0; r < 3; r += 1) {
+      const row = document.createElement("div");
+      row.className = "journey-tab-item journey-loading-row";
+      const icon = document.createElement("span");
+      icon.className = "journey-tab-icon-wrap";
+      const info = document.createElement("div");
+      info.className = "journey-tab-info";
+      const line1 = document.createElement("span");
+      line1.className = "journey-loading-shape journey-loading-row-title";
+      const line2 = document.createElement("span");
+      line2.className = "journey-loading-shape journey-loading-row-host";
+      info.append(line1, line2);
+      row.append(icon, info);
+      pagesList.append(row);
+    }
+
+    const footer = document.createElement("div");
+    footer.className = "journey-card-footer";
+    const btn = document.createElement("span");
+    btn.className = "journey-loading-shape journey-loading-btn";
+    footer.append(btn);
+
+    card.append(header, heading, pagesList, footer);
     list.append(card);
   }
 }
@@ -2544,15 +2657,26 @@ function setContinueLoadingMessage(message) {
   subtitle.textContent = message;
 }
 
-function hideContinueSection() {
+function renderContinueEmpty(message, badge = "Waiting for signal") {
   const section = document.querySelector("#continue-section");
   const list = document.querySelector("#continue-list");
-  section.hidden = true;
+  section.hidden = false;
   section.classList.remove("is-ai-working");
   section.setAttribute("aria-busy", "false");
-  document.querySelector("#continue-subtitle").textContent = "Ongoing journeys from your recent activity";
-  document.querySelector("#continue-badge-label").textContent = "Grouped on-device";
+  document.querySelector("#continue-subtitle").textContent = "Useful journeys appear only when there’s a strong signal";
+  document.querySelector("#continue-badge-label").textContent = badge;
   clearChildren(list);
+
+  const state = document.createElement("div");
+  state.className = "continue-empty-state";
+  const icon = document.createElement("span");
+  icon.className = "continue-empty-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.innerHTML = `<svg viewBox="0 0 24 24" focusable="false"><path d="M4 7h10M4 12h16M4 17h8"/></svg>`;
+  const copy = document.createElement("span");
+  copy.textContent = message;
+  state.append(icon, copy);
+  list.append(state);
 }
 
 async function loadContinueCandidates() {
@@ -2811,75 +2935,117 @@ function renderContinueJourneyCards(journeys, provider = "local") {
     card.style.setProperty("--card-start", colors[0]);
     card.style.setProperty("--card-end", colors[1]);
 
+    // Header
     const header = document.createElement("div");
     header.className = "journey-card-header";
-    const icons = createJourneyIconStack(journey.items);
-    const signal = document.createElement("span");
-    signal.className = "journey-signal";
-    signal.textContent = "Ongoing";
-    header.append(icons, signal);
+
+    const topic = document.createElement("div");
+    topic.className = "journey-card-topic";
+    const topicIcon = document.createElement("span");
+    topicIcon.className = "journey-topic-icon";
+    topicIcon.innerHTML = `<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/></svg>`;
+    const topicLabel = document.createElement("span");
+    topicLabel.className = "journey-topic-label";
+    topicLabel.textContent = "Tab Group";
+    topic.append(topicIcon, topicLabel);
+
+    const count = document.createElement("span");
+    count.className = "journey-card-count";
+    count.textContent = `${journey.items.length} tabs`;
+    header.append(topic, count);
+
+    // Heading
+    const heading = document.createElement("div");
+    heading.className = "journey-card-heading";
 
     const title = document.createElement("h3");
+    title.className = "journey-title";
     title.textContent = journey.label;
-    const sites = document.createElement("p");
-    sites.className = "journey-sites";
-    sites.textContent = [...new Set(journey.items.map((item) => hostnameFor(item.url)))].slice(0, 3).join(" · ");
 
     const activeDays = new Set(journey.items.flatMap((item) => item.visitDays)).size;
     const visits = journey.items.reduce((sum, item) => sum + item.visitCount, 0);
-    const evidence = document.createElement("p");
-    evidence.className = "journey-evidence";
-    evidence.textContent = `${visits} visits across ${activeDays} active days`;
+    const stats = document.createElement("p");
+    stats.className = "journey-stats";
+    stats.textContent = `${visits} visits · ${activeDays} active day${activeDays > 1 ? "s" : ""}`;
+    heading.append(title, stats);
 
-    const actions = document.createElement("div");
-    actions.className = "journey-actions";
-    const continueButton = document.createElement("button");
-    continueButton.className = "journey-continue";
-    continueButton.type = "button";
-    continueButton.textContent = "Continue";
-    continueButton.addEventListener("click", () => {
-      window.location.href = journey.items[0].url;
+    // Tab Pages Inset List
+    const pagesList = document.createElement("div");
+    pagesList.className = "journey-pages-list";
+
+    journey.items.slice(0, 3).forEach((item) => {
+      const row = document.createElement("a");
+      row.className = "journey-tab-item";
+      row.href = item.url;
+      row.title = item.title;
+
+      const iconWrap = document.createElement("span");
+      iconWrap.className = "journey-tab-icon-wrap";
+
+      if (item.url && !item.url.startsWith("chrome://newtab")) {
+        const img = document.createElement("img");
+        img.className = "journey-tab-icon";
+        img.alt = "";
+        img.loading = "lazy";
+        loadIconSources(img, item.url, 64, () => {
+          img.remove();
+          iconWrap.textContent = initialFor(item.title, item.url);
+          iconWrap.style.setProperty("--fallback-bg", iconColorFor(item.title, item.url));
+          iconWrap.classList.add("icon-fallback");
+        });
+        iconWrap.append(img);
+      } else {
+        iconWrap.textContent = initialFor(item.title, item.url);
+        iconWrap.style.setProperty("--fallback-bg", iconColorFor(item.title, item.url));
+        iconWrap.classList.add("icon-fallback");
+      }
+
+      const info = document.createElement("div");
+      info.className = "journey-tab-info";
+
+      const itemTitle = document.createElement("span");
+      itemTitle.className = "journey-tab-title";
+      itemTitle.textContent = readableTitle(item.title, item.url) || hostnameFor(item.url);
+
+      const host = document.createElement("span");
+      host.className = "journey-tab-host";
+      host.textContent = hostnameFor(item.url);
+
+      info.append(itemTitle, host);
+
+      const arrow = document.createElement("span");
+      arrow.className = "journey-tab-arrow";
+      arrow.setAttribute("aria-hidden", "true");
+      arrow.innerHTML = `<svg viewBox="0 0 24 24" focusable="false"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
+
+      row.append(iconWrap, info, arrow);
+
+      row.addEventListener("click", (event) => {
+        event.preventDefault();
+        window.location.href = item.url;
+      });
+
+      pagesList.append(row);
     });
 
-    const arrow = document.createElement("span");
-    arrow.textContent = "→";
-    arrow.setAttribute("aria-hidden", "true");
-    continueButton.append(arrow);
-    actions.append(continueButton);
+    // Footer
+    const footer = document.createElement("div");
+    footer.className = "journey-card-footer";
 
-    if (journey.items.length > 1) {
-      const openAll = document.createElement("button");
-      openAll.className = "journey-open-all";
-      openAll.type = "button";
-      openAll.textContent = `Open ${journey.items.length}`;
-      openAll.setAttribute("aria-label", `Open all ${journey.items.length} pages in ${journey.label}`);
-      openAll.addEventListener("click", () => openJourneyPages(journey.items));
-      actions.append(openAll);
-    }
+    const resumeBtn = document.createElement("button");
+    resumeBtn.className = "journey-resume-btn";
+    resumeBtn.type = "button";
+    resumeBtn.innerHTML = `<span>Resume Group</span><svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
+    resumeBtn.setAttribute("aria-label", `Resume all ${journey.items.length} pages in ${journey.label}`);
+    resumeBtn.addEventListener("click", () => openJourneyPages(journey.items));
 
-    card.append(header, title, sites, evidence, actions);
+    footer.append(resumeBtn);
+
+    card.append(header, heading, pagesList, footer);
     list.append(card);
   });
 
   section.hidden = false;
-}
-
-function createJourneyIconStack(items) {
-  const stack = document.createElement("div");
-  stack.className = "journey-icon-stack";
-  items.slice(0, 3).forEach((item) => {
-    const icon = document.createElement("span");
-    icon.className = "journey-icon";
-    icon.textContent = initialFor(item.title, item.url);
-    icon.style.setProperty("--fallback-bg", iconColorFor(item.title, item.url));
-    const img = document.createElement("img");
-    img.alt = "";
-    img.loading = "lazy";
-    loadIconSources(img, item.url, 64, () => img.remove());
-    icon.append(img);
-    stack.append(icon);
-  });
-  return stack;
 }
 
 function openJourneyPages(items) {
@@ -2924,8 +3090,18 @@ function dayKeyForTimestamp(timestamp) {
 
 function renderEmptyPills(container) {
   for (let index = 0; index < 3; index += 1) {
-    const pill = document.createElement("span");
+    const pill = document.createElement("div");
     pill.className = "recent-pill recent-pill-empty";
+    const icon = document.createElement("span");
+    icon.className = "recent-pill-icon-wrap";
+    const content = document.createElement("div");
+    content.className = "recent-pill-content";
+    const line1 = document.createElement("span");
+    line1.className = "recent-pill-skeleton-line";
+    const line2 = document.createElement("span");
+    line2.className = "recent-pill-skeleton-line short";
+    content.append(line1, line2);
+    pill.append(icon, content);
     container.append(pill);
   }
 }
@@ -3404,42 +3580,74 @@ function setStorageValue(key, value) {
   });
 }
 
-function getSessionStorageValue(key, fallback) {
-  if (!IS_EXTENSION_CONTEXT || !chrome.storage.session) {
-    return Promise.resolve(volatileSessionStorage.has(key) ? volatileSessionStorage.get(key) : fallback);
+function ensureTrustedLocalStorageAccess() {
+  if (!IS_EXTENSION_CONTEXT || typeof chrome.storage.local.setAccessLevel !== "function") {
+    return Promise.resolve();
+  }
+  if (trustedLocalStoragePromise) return trustedLocalStoragePromise;
+
+  trustedLocalStoragePromise = new Promise((resolve, reject) => {
+    chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }, () => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        const storageError = new Error(error.message);
+        storageError.name = "PersistentStorageError";
+        reject(storageError);
+        return;
+      }
+      resolve();
+    });
+  }).catch((error) => {
+    trustedLocalStoragePromise = null;
+    throw error;
+  });
+
+  return trustedLocalStoragePromise;
+}
+
+async function getCloudAiConfigValue() {
+  if (!IS_EXTENSION_CONTEXT) return volatileCloudAiConfig;
+
+  try {
+    await ensureTrustedLocalStorageAccess();
+  } catch (error) {
+    console.warn("Unable to restrict Gemini key storage to trusted extension contexts", error.message);
+    return null;
   }
 
   return new Promise((resolve) => {
-    chrome.storage.session.get({ [key]: fallback }, (items) => {
+    chrome.storage.local.get({ [CLOUD_AI_CONFIG_KEY]: null }, (items) => {
       const error = chrome.runtime.lastError;
       if (error) {
-        console.warn("Unable to read session-only AI settings", error.message);
-        resolve(fallback);
+        console.warn("Unable to read device-local Gemini settings", error.message);
+        resolve(null);
         return;
       }
-      resolve(items[key]);
+      resolve(items[CLOUD_AI_CONFIG_KEY]);
     });
   });
 }
 
-function setSessionStorageValue(key, value) {
-  if (!IS_EXTENSION_CONTEXT || !chrome.storage.session) {
-    if (value === null || typeof value === "undefined") volatileSessionStorage.delete(key);
-    else volatileSessionStorage.set(key, value);
-    return Promise.resolve();
+async function setCloudAiConfigValue(value) {
+  if (!IS_EXTENSION_CONTEXT) {
+    volatileCloudAiConfig = value;
+    return;
   }
 
+  await ensureTrustedLocalStorageAccess();
   return new Promise((resolve, reject) => {
     const operation = value === null || typeof value === "undefined"
-      ? chrome.storage.session.remove.bind(chrome.storage.session)
-      : chrome.storage.session.set.bind(chrome.storage.session);
-    const payload = value === null || typeof value === "undefined" ? key : { [key]: value };
+      ? chrome.storage.local.remove.bind(chrome.storage.local)
+      : chrome.storage.local.set.bind(chrome.storage.local);
+    const payload = value === null || typeof value === "undefined"
+      ? CLOUD_AI_CONFIG_KEY
+      : { [CLOUD_AI_CONFIG_KEY]: value };
     operation(payload, () => {
       const error = chrome.runtime.lastError;
       if (error) {
-        console.warn("Unable to update session-only AI settings", error.message);
+        console.warn("Unable to update device-local Gemini settings", error.message);
         const storageError = new Error(error.message);
-        storageError.name = "SessionStorageError";
+        storageError.name = "PersistentStorageError";
         reject(storageError);
         return;
       }

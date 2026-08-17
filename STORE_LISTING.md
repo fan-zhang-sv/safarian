@@ -39,7 +39,7 @@ Replace Chrome's new tab page with a personal dashboard for bookmarks, session r
 - `sessions`: reads and restores recently closed tabs and windows.
 - `tabs`: allows recently closed session entries to include tab title and URL, which are needed for readable restore items.
 - `history`: powers Recall and identifies repeated multi-day activity for Continue.
-- `storage`: stores appearance, background, hidden recently-closed timestamp, cached AI results, local retry metadata, and an optional Gemini key in Chrome's session-only in-memory storage.
+- `storage`: stores appearance, background, hidden recently-closed timestamp, cached AI results, local retry metadata, and an optional device-local Gemini key restricted to trusted extension contexts.
 - `favicon`: uses Chrome's built-in favicon endpoint as a final site icon fallback.
 
 ## Privacy Practice Notes
@@ -50,7 +50,7 @@ Replace Chrome's new tab page with a personal dashboard for bookmarks, session r
 - No developer-operated server.
 - Chrome API data is not sent to the developer.
 - Recall always runs locally. Smart Recent Tabs and Continue run locally by default. If a user explicitly enables Gemini Flash and accepts the disclosure, eligible titles, domains, URL paths, timing, and activity counts are sent directly from Chrome to Google's Gemini API under the user's own key. They are never sent to the developer.
-- The optional Gemini key is kept only for the current Chrome session, is not synced or persistently stored by Safarian, and can be forgotten at any time.
+- The optional Gemini key is remembered only in the current device's Chrome extension profile, restricted to trusted extension contexts, never synced, and can be forgotten at any time.
 - Site icon and remote background image requests are made directly by the browser to the relevant image host.
 - The privacy policy text is in `PRIVACY.md`; host it at a public URL and provide that URL in the Chrome Web Store privacy policy field.
 

@@ -30,7 +30,7 @@
           <li>Bookmarks, to mirror the Chrome Bookmarks Bar as favorites.</li>
           <li>Recently closed tabs, to show recoverable closed tabs.</li>
           <li>Browsing history, to power local Recall and identify repeated activity for Continue.</li>
-          <li>Extension storage, to save appearance, background, cached site icon choices, local display preferences, cached AI results, retry metadata, and an optional session-only Gemini API key.</li>
+          <li>Extension storage, to save appearance, background, cached site icon choices, local display preferences, cached AI results, retry metadata, and an optional device-local Gemini API key.</li>
           <li>
             High-resolution site icon candidates plus geticon.dev, Google, DuckDuckGo, and Chrome's built-in
             favicon endpoints, to display site icons.
@@ -66,9 +66,11 @@
           repeated failed cloud requests.
         </p>
         <p>
-          Your Gemini API key is stored only in Chrome's in-memory session storage. It is not synced or written to
-          persistent extension storage by Safarian. It is removed when you select Forget key, reload or disable the
-          extension, or end the Chrome browser session. The key is sent only to Google's Gemini API for authentication.
+          Your Gemini API key is stored in Chrome's device-local extension storage so Safarian can continue using it
+          after the extension or browser restarts. Safarian restricts that storage area to trusted extension contexts
+          and never syncs the key. Passwordless local storage is a convenience, not an OS-backed secret vault: someone
+          who controls your device or Chrome profile may be able to access it. The key remains until you select Forget
+          key, remove Safarian, or clear its extension data. It is sent only to Google's Gemini API for authentication.
         </p>
       </section>
 
