@@ -9,7 +9,13 @@ const ICON_CACHE_KEY = "faviconCache";
 const RECENT_ORGANIZATION_CACHE_KEY = "recentClosedOrganization";
 const CONTINUE_JOURNEY_CACHE_KEY = "continueJourneys";
 const AI_ATTEMPT_STATE_KEY = "browserAiAttemptState";
+const CLOUD_AI_SESSION_KEY = "geminiCloudSession";
 const AI_ORGANIZER_LOCK_NAME = "safarian-browser-ai-organizer";
+const RECENT_CLOUD_MODEL = "gemini-3.5-flash-lite";
+const CONTINUE_CLOUD_MODEL = "gemini-3.7-flash";
+const GEMINI_INTERACTIONS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
+const GEMINI_REQUEST_TIMEOUT = 10000;
+const CLOUD_FALLBACK_CACHE_TTL = 60 * 60 * 1000;
 const ICON_CACHE_TTL = 14 * 24 * 60 * 60 * 1000;
 const RECENT_ORGANIZATION_CACHE_TTL = 6 * 60 * 60 * 1000;
 const CONTINUE_JOURNEY_CACHE_TTL = 12 * 60 * 60 * 1000;
@@ -46,6 +52,7 @@ let recentRenderRequest = 0;
 let browserOrganizerSession = null;
 let browserOrganizerSessionPromise = null;
 let browserOrganizerPromptQueue = Promise.resolve();
+const volatileSessionStorage = new Map();
 
 const themePalettes = {
   classic: [
@@ -689,6 +696,7 @@ async function setupCustomizeControls() {
   await applyStoredTheme();
   await applyStoredAppearance();
   await applyStoredBackground();
+  await setupCloudAiControls();
 
   themeButtons.forEach((button) => {
     button.addEventListener("click", async () => {
@@ -752,6 +760,194 @@ async function setupCustomizeControls() {
     await saveBackground({ type: "upload", value });
     fileInput.value = "";
   });
+}
+
+async function setupCloudAiControls() {
+  const providerButtons = document.querySelectorAll("[data-ai-provider]");
+  const keyInput = document.querySelector("#cloud-ai-key");
+  const consentInput = document.querySelector("#cloud-ai-consent");
+  const connectButton = document.querySelector("#cloud-ai-connect");
+  const replaceButton = document.querySelector("#cloud-ai-replace");
+  const forgetButton = document.querySelector("#cloud-ai-forget");
+  let isReplacing = false;
+  let config = await getCloudAiSessionConfig({ includeDisabled: true });
+
+  renderCloudAiControls(config?.enabled ? "cloud" : "local", config);
+
+  providerButtons.forEach((button) => {
+    button.addEventListener("click", async () => {
+      const provider = button.dataset.aiProvider;
+      config = await getCloudAiSessionConfig({ includeDisabled: true });
+
+      if (provider === "local") {
+        isReplacing = false;
+        if (config) {
+          config = { ...config, enabled: false };
+          try {
+            await setSessionStorageValue(CLOUD_AI_SESSION_KEY, config);
+          } catch (error) {
+            setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
+            return;
+          }
+        }
+        renderCloudAiControls("local", config);
+        setCloudAiStatus("Using private on-device Gemini Nano.", "ready");
+        await refreshAiSectionsForProviderChange();
+        return;
+      }
+
+      if (config?.apiKey) {
+        isReplacing = false;
+        config = { ...config, enabled: true };
+        try {
+          await setSessionStorageValue(CLOUD_AI_SESSION_KEY, config);
+        } catch (error) {
+          setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
+          return;
+        }
+        renderCloudAiControls("cloud", config);
+        setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
+        await refreshAiSectionsForProviderChange();
+        return;
+      }
+
+      renderCloudAiControls("cloud", null);
+      keyInput.focus();
+    });
+  });
+
+  replaceButton.addEventListener("click", () => {
+    isReplacing = true;
+    const keyField = keyInput.closest("label");
+    keyField.hidden = false;
+    connectButton.hidden = false;
+    connectButton.textContent = "Test & replace key";
+    replaceButton.hidden = true;
+    consentInput.checked = true;
+    setCloudAiStatus("Your current key stays active until the replacement passes its test.", "loading");
+    keyInput.focus();
+  });
+
+  connectButton.addEventListener("click", async () => {
+    const apiKey = keyInput.value.trim();
+    if (!apiKey) {
+      setCloudAiStatus("Paste a Gemini API key to continue.", "error");
+      keyInput.focus();
+      return;
+    }
+    if (!consentInput.checked) {
+      setCloudAiStatus("Confirm the data disclosure before enabling cloud AI.", "error");
+      consentInput.focus();
+      return;
+    }
+
+    connectButton.disabled = true;
+    connectButton.setAttribute("aria-busy", "true");
+    connectButton.textContent = "Testing securely…";
+    setCloudAiStatus("Checking the key with Flash-Lite without sending browsing data…", "loading");
+
+    try {
+      await testGeminiFlashKey(apiKey);
+      const nextConfig = {
+        enabled: true,
+        apiKey,
+        keyId: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+        routingVersion: 2,
+        connectedAt: Date.now()
+      };
+      await setSessionStorageValue(CLOUD_AI_SESSION_KEY, nextConfig);
+      const savedConfig = await getCloudAiSessionConfig({ includeDisabled: true });
+      if (!savedConfig || savedConfig.keyId !== nextConfig.keyId) {
+        const storageError = new Error("Chrome did not retain the session-only Gemini key");
+        storageError.name = "SessionStorageError";
+        throw storageError;
+      }
+      config = savedConfig;
+      isReplacing = false;
+      keyInput.value = "";
+      renderCloudAiControls("cloud", config);
+      setCloudAiStatus("Connected. Flash-Lite handles Recent; 3.7 Flash handles Continue.", "ready");
+      await refreshAiSectionsForProviderChange();
+    } catch (error) {
+      setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
+    } finally {
+      connectButton.disabled = false;
+      connectButton.setAttribute("aria-busy", "false");
+      connectButton.textContent = isReplacing ? "Test & replace key" : "Test & use Flash";
+    }
+  });
+
+  forgetButton.addEventListener("click", async () => {
+    try {
+      await setSessionStorageValue(CLOUD_AI_SESSION_KEY, null);
+    } catch (error) {
+      setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
+      return;
+    }
+    isReplacing = false;
+    config = null;
+    keyInput.value = "";
+    consentInput.checked = false;
+    renderCloudAiControls("local", null);
+    setCloudAiStatus("Key forgotten. Using on-device Gemini Nano.", "ready");
+    await refreshAiSectionsForProviderChange();
+  });
+}
+
+function renderCloudAiControls(provider, config) {
+  const setup = document.querySelector("#cloud-ai-setup");
+  const consent = document.querySelector("#cloud-ai-consent");
+  const keyField = document.querySelector("#cloud-ai-key").closest("label");
+  const consentField = consent.closest("label");
+  const connectButton = document.querySelector("#cloud-ai-connect");
+  const replaceButton = document.querySelector("#cloud-ai-replace");
+  const forgetButton = document.querySelector("#cloud-ai-forget");
+  const hasKey = Boolean(config?.apiKey);
+
+  document.querySelectorAll("[data-ai-provider]").forEach((button) => {
+    const selected = button.dataset.aiProvider === provider;
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
+
+  setup.hidden = provider !== "cloud";
+  keyField.hidden = hasKey;
+  consentField.hidden = hasKey;
+  connectButton.hidden = hasKey;
+  replaceButton.hidden = !hasKey;
+  forgetButton.hidden = !hasKey;
+  consent.checked = hasKey;
+  consent.disabled = hasKey;
+  if (provider === "cloud" && hasKey) {
+    setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
+  } else if (provider === "cloud") {
+    setCloudAiStatus("Add your key to activate cloud AI.");
+  }
+}
+
+function setCloudAiStatus(message, state = "") {
+  const status = document.querySelector("#cloud-ai-status");
+  if (!status) return;
+  status.textContent = message;
+  status.dataset.state = state;
+}
+
+function cloudAiSetupErrorMessage(error) {
+  if (error?.name === "SessionStorageError") {
+    return "Chrome couldn’t retain this session-only key. Reload the extension and try again.";
+  }
+  if (error?.name === "TimeoutError") return "Gemini took too long to respond. Check your connection and try again.";
+  if (error?.reason === "API_KEY_INVALID" || error?.status === 401 || error?.status === 403) {
+    return "Google rejected this key. Check that it is active and try again.";
+  }
+  if (error?.status === 429) return "This key has reached its Gemini quota. Try again later or use on-device AI.";
+  return "Couldn’t connect to Gemini Flash. Your key was not saved.";
+}
+
+async function refreshAiSectionsForProviderChange() {
+  recentDisplayMode = "smart";
+  await renderRecentlyClosed();
+  await renderContinueJourneys();
 }
 
 function setupFavoriteContextMenu() {
@@ -1110,16 +1306,22 @@ async function renderRecentlyClosed({ forceOrganize = false, allowDownload = fal
   const organizableItems = items.filter((item) => isHttpUrl(item.url)).slice(0, MAX_RECENT_ORGANIZER_CANDIDATES);
   if (recentDisplayMode !== "smart" || organizableItems.length < 3) return;
 
-  const fingerprint = recentOrganizationFingerprint(organizableItems);
+  const cloudConfig = await getCloudAiSessionConfig();
+  const fingerprint = recentOrganizationFingerprint(
+    organizableItems,
+    aiProviderCacheKey(cloudConfig, RECENT_CLOUD_MODEL)
+  );
   const cached = await getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null);
   const cachedGroups = hydrateRecentOrganization(cached, fingerprint, organizableItems);
 
   if (cachedGroups.length && !forceOrganize) {
-    renderOrganizedRecent(recentList, cachedGroups, items.length);
+    renderOrganizedRecent(recentList, cachedGroups, items.length, cached.provider || "local");
     return;
   }
 
-  setRecentOrganizationBusy(true, "AI is reviewing your closed tabs…");
+  setRecentOrganizationBusy(true, cloudConfig
+    ? "Gemini Flash-Lite is reviewing your closed tabs…"
+    : "On-device AI is reviewing your closed tabs…");
   let result;
   try {
     result = await runRateLimitedAiTask({
@@ -1129,19 +1331,20 @@ async function renderRecentlyClosed({ forceOrganize = false, allowDownload = fal
       loadCached: async () => {
         const latestCache = await getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null);
         const groups = hydrateRecentOrganization(latestCache, fingerprint, organizableItems);
-        return groups.length ? { status: "success", groups } : null;
+        return groups.length ? { status: "success", groups, provider: latestCache.provider || "local" } : null;
       },
       saveSuccess: (success) => setStorageValue(
         RECENT_ORGANIZATION_CACHE_KEY,
-        serializeRecentOrganization(fingerprint, success.groups)
+        serializeRecentOrganization(fingerprint, success.groups, success.provider, success.fallbackFromCloud)
       ),
       task: () => generateRecentOrganization(organizableItems, {
         allowDownload,
+        cloudConfig,
         onStatus: (message) => setRecentOrganizationNote(message, "loading")
       })
     });
   } catch (error) {
-    console.warn("Chrome built-in Gemini recent-tab orchestration failed", describeGeminiError(error));
+    console.warn("Gemini recent-tab orchestration failed", describeGeminiError(error));
     resetBrowserOrganizerSession();
     result = { status: "error", groups: [] };
   }
@@ -1150,7 +1353,7 @@ async function renderRecentlyClosed({ forceOrganize = false, allowDownload = fal
   setRecentOrganizationBusy(false);
 
   if (result.status === "success" && result.groups.length) {
-    renderOrganizedRecent(recentList, result.groups, items.length);
+    renderOrganizedRecent(recentList, result.groups, items.length, result.provider || "local");
     return;
   }
 
@@ -1179,7 +1382,7 @@ function renderRecentChronological(container, items) {
   items.forEach((item) => container.append(createRecentButton(item)));
 }
 
-function renderOrganizedRecent(container, groups, totalItemCount) {
+function renderOrganizedRecent(container, groups, totalItemCount, provider = "local") {
   container.className = "recent-grid recent-grid-organized";
   clearChildren(container);
 
@@ -1210,7 +1413,8 @@ function renderOrganizedRecent(container, groups, totalItemCount) {
   });
 
   updateRecentControls(recentItemsState);
-  setRecentOrganizationNote(`Organized privately by AI · ${groups.reduce((sum, group) => sum + group.items.length, 0)} picks from ${totalItemCount}`, "ready");
+  const source = provider === "cloud" ? "Organized by Gemini Flash" : "Organized privately on-device";
+  setRecentOrganizationNote(`${source} · ${groups.reduce((sum, group) => sum + group.items.length, 0)} picks from ${totalItemCount}`, "ready");
 }
 
 function createRecentButton(item, { reason = "", topPick = false } = {}) {
@@ -1269,7 +1473,7 @@ function updateRecentControls(items) {
   organizeLabel.textContent = recentDisplayMode === "smart" ? "Recent order" : "Organize";
   organizeButton.title = recentDisplayMode === "smart"
     ? "Return to Chrome's chronological order"
-    : "Group and rank recently closed tabs with on-device Gemini";
+    : "Group and rank recently closed tabs with AI";
 
   if (!hasItems || recentDisplayMode === "recent") {
     setRecentOrganizationNote("");
@@ -1295,13 +1499,14 @@ function setRecentOrganizationNote(message, state = "") {
   note.hidden = !message;
 }
 
-function recentOrganizationFingerprint(items) {
-  return items.map((item) => `${item.sessionId}:${item.lastModified}`).join("|");
+function recentOrganizationFingerprint(items, providerKey = "nano") {
+  return `${providerKey}|${items.map((item) => `${item.sessionId}:${item.lastModified}`).join("|")}`;
 }
 
 function hydrateRecentOrganization(cache, fingerprint, items) {
   if (!cache || cache.fingerprint !== fingerprint || !Array.isArray(cache.groups)) return [];
-  if (Date.now() - Number(cache.createdAt || 0) > RECENT_ORGANIZATION_CACHE_TTL) return [];
+  const ttl = cache.fallbackFromCloud ? CLOUD_FALLBACK_CACHE_TTL : RECENT_ORGANIZATION_CACHE_TTL;
+  if (Date.now() - Number(cache.createdAt || 0) > ttl) return [];
 
   const bySessionId = new Map(items.map((item) => [item.sessionId, item]));
   return cache.groups
@@ -1319,9 +1524,11 @@ function hydrateRecentOrganization(cache, fingerprint, items) {
     .slice(0, 3);
 }
 
-function serializeRecentOrganization(fingerprint, groups) {
+function serializeRecentOrganization(fingerprint, groups, provider = "local", fallbackFromCloud = false) {
   return {
     fingerprint,
+    provider,
+    fallbackFromCloud,
     createdAt: Date.now(),
     groups: groups.map((group) => ({
       label: group.label,
@@ -1506,7 +1713,25 @@ async function createBrowserOrganizerSession({ allowDownload, onStatus }) {
   }
 }
 
-async function generateRecentOrganization(items, { allowDownload, onStatus }) {
+async function generateRecentOrganization(items, { allowDownload, cloudConfig, onStatus }) {
+  let fallbackFromCloud = false;
+  if (cloudConfig) {
+    try {
+      onStatus("Gemini Flash-Lite is ranking the best tabs to resume…");
+      const groups = await rankRecentSessionsWithGemini(
+        createGeminiFlashPromptSession(cloudConfig, RECENT_CLOUD_MODEL),
+        items
+      );
+      setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
+      return { status: groups.length ? "success" : "empty", groups, provider: "cloud" };
+    } catch (error) {
+      fallbackFromCloud = true;
+      console.warn("Gemini Flash tab organization failed", describeGeminiError(error));
+      setCloudAiStatus("Flash was unavailable, so Safarian used on-device AI for this request.", "warning");
+      onStatus("Flash is unavailable · finishing privately on-device…");
+    }
+  }
+
   const sessionResult = await getBrowserOrganizerSession({ allowDownload, onStatus });
   if (sessionResult.status !== "success") {
     return { status: sessionResult.status, groups: [] };
@@ -1518,12 +1743,118 @@ async function generateRecentOrganization(items, { allowDownload, onStatus }) {
       sessionResult.session,
       (promptSession) => rankRecentSessionsWithGemini(promptSession, items)
     );
-    return { status: groups.length ? "success" : "empty", groups };
+    return { status: groups.length ? "success" : "empty", groups, provider: "local", fallbackFromCloud };
   } catch (error) {
     console.warn("Chrome built-in Gemini tab organization failed", describeGeminiError(error));
     resetBrowserOrganizerSession();
     return { status: "error", groups: [] };
   }
+}
+
+function createGeminiFlashPromptSession(config, model) {
+  return {
+    prompt(prompt, options = {}) {
+      return promptGeminiFlash(config.apiKey, model, prompt, options.responseConstraint);
+    }
+  };
+}
+
+async function testGeminiFlashKey(apiKey) {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["ok"],
+    properties: { ok: { type: "boolean" } }
+  };
+  const response = await promptGeminiFlash(
+    apiKey,
+    RECENT_CLOUD_MODEL,
+    'Return {"ok":true}. This is a connection test; no user data is included.',
+    schema,
+    32
+  );
+  const parsed = parseGeminiJson(response);
+  if (parsed.ok !== true) throw new Error("Gemini connection test returned an invalid response");
+}
+
+async function promptGeminiFlash(apiKey, model, prompt, schema, maxOutputTokens = 512) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT);
+
+  try {
+    const response = await fetch(GEMINI_INTERACTIONS_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey
+      },
+      body: JSON.stringify({
+        model,
+        input: prompt,
+        system_instruction: "Organize only the real browser items supplied by the user. Never invent pages, URLs, or IDs.",
+        response_format: {
+          type: "text",
+          mime_type: "application/json",
+          schema
+        },
+        generation_config: {
+          max_output_tokens: maxOutputTokens,
+          thinking_level: model === CONTINUE_CLOUD_MODEL ? "low" : "minimal",
+          thinking_summaries: "none"
+        },
+        store: false
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      let reason = "";
+      try {
+        const failure = await response.json();
+        const details = Array.isArray(failure) ? failure[0]?.error?.details : failure?.error?.details;
+        reason = Array.isArray(details)
+          ? String(details.find((detail) => detail?.reason)?.reason || "")
+          : "";
+      } catch {
+        // Status alone is enough to choose a safe fallback.
+      }
+      const error = new Error(`Gemini Flash request failed with status ${response.status}`);
+      error.name = "GeminiCloudError";
+      error.status = response.status;
+      error.reason = reason;
+      throw error;
+    }
+
+    const data = await response.json();
+    const text = (Array.isArray(data.steps) ? data.steps : [])
+      .filter((step) => step?.type === "model_output")
+      .flatMap((step) => Array.isArray(step.content) ? step.content : [])
+      .filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("");
+    if (!text) throw new Error("Gemini Flash returned no text output");
+    return text;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error("Gemini Flash request timed out");
+      timeoutError.name = "TimeoutError";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function getCloudAiSessionConfig({ includeDisabled = false } = {}) {
+  const config = await getSessionStorageValue(CLOUD_AI_SESSION_KEY, null);
+  if (!config || typeof config.apiKey !== "string" || !config.apiKey.trim() || !config.keyId) return null;
+  if (!includeDisabled && config.enabled !== true) return null;
+  return config;
+}
+
+function aiProviderCacheKey(cloudConfig, model) {
+  return cloudConfig ? `flash:${model}:${cloudConfig.keyId}` : "nano";
 }
 
 function runBrowserOrganizerPrompt(baseSession, task) {
@@ -2088,9 +2419,10 @@ async function moveFavorite(fromIndex, toIndex) {
   });
 }
 
-async function renderContinueJourneys() {
+async function renderContinueJourneys({ force = false } = {}) {
   const section = document.querySelector("#continue-section");
   const badgeLabel = document.querySelector("#continue-badge-label");
+  const cloudConfig = IS_EXTENSION_CONTEXT ? await getCloudAiSessionConfig() : null;
 
   hideContinueSection();
   if (SHOW_AI_LOADING_PREVIEW) {
@@ -2099,7 +2431,12 @@ async function renderContinueJourneys() {
   }
 
   if (IS_EXTENSION_CONTEXT) {
-    renderContinueLoading("AI is checking your recent activity for work worth resuming…");
+    renderContinueLoading(
+      cloudConfig
+        ? "Gemini 3.7 Flash is checking your recent activity for work worth resuming…"
+        : "On-device AI is checking your recent activity for work worth resuming…",
+      cloudConfig ? "cloud" : "local"
+    );
   }
 
   const candidates = await loadContinueCandidates();
@@ -2114,11 +2451,14 @@ async function renderContinueJourneys() {
     return;
   }
 
-  const fingerprint = continueJourneyFingerprint(candidates);
+  const fingerprint = continueJourneyFingerprint(
+    candidates,
+    aiProviderCacheKey(cloudConfig, CONTINUE_CLOUD_MODEL)
+  );
   const cached = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
   const cachedJourneys = hydrateContinueJourneys(cached, fingerprint, candidates);
-  if (cachedJourneys.length) {
-    renderContinueJourneyCards(cachedJourneys);
+  if (cachedJourneys.length && !force) {
+    renderContinueJourneyCards(cachedJourneys, cached.provider || "local");
     return;
   }
 
@@ -2126,42 +2466,34 @@ async function renderContinueJourneys() {
     const result = await runRateLimitedAiTask({
       feature: "continue",
       fingerprint,
+      force,
       loadCached: async () => {
         const latestCache = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
         const journeys = hydrateContinueJourneys(latestCache, fingerprint, candidates);
-        return journeys.length ? { status: "success", journeys } : null;
+        return journeys.length ? { status: "success", journeys, provider: latestCache.provider || "local" } : null;
       },
       saveSuccess: (success) => setStorageValue(
         CONTINUE_JOURNEY_CACHE_KEY,
-        serializeContinueJourneys(fingerprint, success.journeys)
+        serializeContinueJourneys(fingerprint, success.journeys, success.provider, success.fallbackFromCloud)
       ),
-      task: async () => {
-        const sessionResult = await getBrowserOrganizerSession({ allowDownload: false });
-        if (sessionResult.status !== "success") {
-          return { status: sessionResult.status, journeys: [] };
-        }
-
-        setContinueLoadingMessage("AI is connecting related pages into useful journeys…");
-        const journeys = await runBrowserOrganizerPrompt(
-          sessionResult.session,
-          (promptSession) => rankContinueJourneysWithGemini(promptSession, candidates)
-        );
-        return { status: journeys.length ? "success" : "empty", journeys };
-      }
+      task: () => generateContinueJourneys(candidates, {
+        cloudConfig,
+        onStatus: setContinueLoadingMessage
+      })
     });
     if (result.status !== "success" || !result.journeys.length) {
       hideContinueSection();
       return;
     }
-    renderContinueJourneyCards(result.journeys);
+    renderContinueJourneyCards(result.journeys, result.provider || "local");
   } catch (error) {
-    console.warn("Chrome built-in Gemini Continue grouping failed", describeGeminiError(error));
+    console.warn("Gemini Continue grouping failed", describeGeminiError(error));
     resetBrowserOrganizerSession();
     hideContinueSection();
   }
 }
 
-function renderContinueLoading(message) {
+function renderContinueLoading(message, provider = "local") {
   const section = document.querySelector("#continue-section");
   const list = document.querySelector("#continue-list");
   const badgeLabel = document.querySelector("#continue-badge-label");
@@ -2171,7 +2503,7 @@ function renderContinueLoading(message) {
   section.hidden = false;
   section.classList.add("is-ai-working");
   section.setAttribute("aria-busy", "true");
-  badgeLabel.textContent = "AI working on-device";
+  badgeLabel.textContent = provider === "cloud" ? "Gemini Flash working" : "AI working on-device";
   setContinueLoadingMessage(message);
   clearChildren(list);
 
@@ -2384,15 +2716,54 @@ async function rankContinueJourneysWithGemini(session, candidates) {
     }, []);
 }
 
-function continueJourneyFingerprint(candidates) {
-  return candidates.map((item) => (
+async function generateContinueJourneys(candidates, { cloudConfig, onStatus }) {
+  let fallbackFromCloud = false;
+  if (cloudConfig) {
+    try {
+      onStatus("Gemini 3.7 Flash is connecting related pages into useful journeys…");
+      const journeys = await rankContinueJourneysWithGemini(
+        createGeminiFlashPromptSession(cloudConfig, CONTINUE_CLOUD_MODEL),
+        candidates
+      );
+      setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
+      return { status: journeys.length ? "success" : "empty", journeys, provider: "cloud" };
+    } catch (error) {
+      fallbackFromCloud = true;
+      console.warn("Gemini Flash Continue grouping failed", describeGeminiError(error));
+      setCloudAiStatus("Flash was unavailable, so Safarian used on-device AI for this request.", "warning");
+      onStatus("Flash is unavailable · finishing privately on-device…");
+    }
+  }
+
+  const sessionResult = await getBrowserOrganizerSession({ allowDownload: false });
+  if (sessionResult.status !== "success") {
+    return { status: sessionResult.status, journeys: [] };
+  }
+
+  onStatus("On-device AI is connecting related pages into useful journeys…");
+  try {
+    const journeys = await runBrowserOrganizerPrompt(
+      sessionResult.session,
+      (promptSession) => rankContinueJourneysWithGemini(promptSession, candidates)
+    );
+    return { status: journeys.length ? "success" : "empty", journeys, provider: "local", fallbackFromCloud };
+  } catch (error) {
+    console.warn("Chrome built-in Gemini Continue grouping failed", describeGeminiError(error));
+    resetBrowserOrganizerSession();
+    return { status: "error", journeys: [] };
+  }
+}
+
+function continueJourneyFingerprint(candidates, providerKey = "nano") {
+  return `${providerKey}|${candidates.map((item) => (
     `${journeyUrlKey(item.url)}:${item.visitCount}:${item.visitDays.length}:${item.lastVisitTime}`
-  )).join("|");
+  )).join("|")}`;
 }
 
 function hydrateContinueJourneys(cache, fingerprint, candidates) {
   if (!cache || cache.fingerprint !== fingerprint || !Array.isArray(cache.journeys)) return [];
-  if (Date.now() - Number(cache.createdAt || 0) > CONTINUE_JOURNEY_CACHE_TTL) return [];
+  const ttl = cache.fallbackFromCloud ? CLOUD_FALLBACK_CACHE_TTL : CONTINUE_JOURNEY_CACHE_TTL;
+  if (Date.now() - Number(cache.createdAt || 0) > ttl) return [];
 
   const byUrl = new Map(candidates.map((item) => [journeyUrlKey(item.url), item]));
   return cache.journeys
@@ -2407,9 +2778,11 @@ function hydrateContinueJourneys(cache, fingerprint, candidates) {
     .slice(0, 3);
 }
 
-function serializeContinueJourneys(fingerprint, journeys) {
+function serializeContinueJourneys(fingerprint, journeys, provider = "local", fallbackFromCloud = false) {
   return {
     fingerprint,
+    provider,
+    fallbackFromCloud,
     createdAt: Date.now(),
     journeys: journeys.map((journey) => ({
       label: journey.label,
@@ -2418,7 +2791,7 @@ function serializeContinueJourneys(fingerprint, journeys) {
   };
 }
 
-function renderContinueJourneyCards(journeys) {
+function renderContinueJourneyCards(journeys, provider = "local") {
   const section = document.querySelector("#continue-section");
   const list = document.querySelector("#continue-list");
   const subtitle = document.querySelector("#continue-subtitle");
@@ -2428,7 +2801,7 @@ function renderContinueJourneyCards(journeys) {
   section.classList.remove("is-ai-working");
   section.setAttribute("aria-busy", "false");
   subtitle.textContent = "Ongoing journeys from your recent activity";
-  badgeLabel.textContent = "Grouped on-device";
+  badgeLabel.textContent = provider === "cloud" ? "Grouped by Gemini Flash" : "Grouped on-device";
   clearChildren(list);
 
   journeys.forEach((journey, index) => {
@@ -3025,6 +3398,50 @@ function setStorageValue(key, value) {
       const error = chrome.runtime.lastError;
       if (error) {
         console.warn(error);
+      }
+      resolve();
+    });
+  });
+}
+
+function getSessionStorageValue(key, fallback) {
+  if (!IS_EXTENSION_CONTEXT || !chrome.storage.session) {
+    return Promise.resolve(volatileSessionStorage.has(key) ? volatileSessionStorage.get(key) : fallback);
+  }
+
+  return new Promise((resolve) => {
+    chrome.storage.session.get({ [key]: fallback }, (items) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        console.warn("Unable to read session-only AI settings", error.message);
+        resolve(fallback);
+        return;
+      }
+      resolve(items[key]);
+    });
+  });
+}
+
+function setSessionStorageValue(key, value) {
+  if (!IS_EXTENSION_CONTEXT || !chrome.storage.session) {
+    if (value === null || typeof value === "undefined") volatileSessionStorage.delete(key);
+    else volatileSessionStorage.set(key, value);
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const operation = value === null || typeof value === "undefined"
+      ? chrome.storage.session.remove.bind(chrome.storage.session)
+      : chrome.storage.session.set.bind(chrome.storage.session);
+    const payload = value === null || typeof value === "undefined" ? key : { [key]: value };
+    operation(payload, () => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        console.warn("Unable to update session-only AI settings", error.message);
+        const storageError = new Error(error.message);
+        storageError.name = "SessionStorageError";
+        reject(storageError);
+        return;
       }
       resolve();
     });

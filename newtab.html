@@ -72,7 +72,7 @@
             <p class="recent-mode-note" id="recent-mode-note" role="status" aria-live="polite" hidden></p>
           </div>
           <div class="recent-actions">
-            <button class="recent-organize-button" id="recent-organize" type="button" aria-pressed="false" title="Group and rank recently closed tabs with on-device Gemini">
+            <button class="recent-organize-button" id="recent-organize" type="button" aria-pressed="false" title="Group and rank recently closed tabs with AI">
               <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
                 <path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path>
               </svg>
@@ -111,6 +111,45 @@
         <div class="customize-panel-header">
           <h2>Customize</h2>
           <button class="panel-close" id="customize-close" type="button" aria-label="Close customize panel"></button>
+        </div>
+
+        <div class="panel-group ai-engine-group">
+          <div>
+            <h3>AI engine</h3>
+            <p>Choose privacy-first on-device AI or opt in to faster, stronger cloud grouping.</p>
+          </div>
+          <div class="ai-provider-control" role="group" aria-label="AI engine">
+            <button class="ai-provider-option" type="button" data-ai-provider="local" aria-pressed="true">
+              <span>On-device</span>
+              <small>Private · no key</small>
+            </button>
+            <button class="ai-provider-option" type="button" data-ai-provider="cloud" aria-pressed="false">
+              <span>Gemini Flash</span>
+              <small>Faster · stronger</small>
+            </button>
+          </div>
+          <div class="cloud-ai-setup" id="cloud-ai-setup" hidden>
+            <div class="cloud-ai-disclosure">
+              <strong>Before you enable cloud AI</strong>
+              <p>Eligible tab titles, domains, URL paths, timing, and visit counts for Recent and Continue will be sent directly from Chrome to Google Gemini. Safarian never receives them.</p>
+            </div>
+            <label class="cloud-ai-key-field">
+              <span>Gemini API key</span>
+              <input id="cloud-ai-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Google AI Studio key">
+            </label>
+            <label class="cloud-ai-consent">
+              <input id="cloud-ai-consent" type="checkbox">
+              <span>I understand this browsing metadata will be sent to Google.</span>
+            </label>
+            <p class="cloud-ai-storage-note">Your key is kept only for this Chrome session and is never synced or saved to disk by Safarian.</p>
+            <div class="cloud-ai-actions">
+              <button class="cloud-ai-connect" id="cloud-ai-connect" type="button">Test &amp; use Flash</button>
+              <button class="cloud-ai-replace" id="cloud-ai-replace" type="button" hidden>Replace key</button>
+              <button class="cloud-ai-forget" id="cloud-ai-forget" type="button" hidden>Forget key</button>
+              <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer">Get a key</a>
+            </div>
+            <p class="cloud-ai-status" id="cloud-ai-status" role="status" aria-live="polite"></p>
+          </div>
         </div>
 
         <div class="panel-group">

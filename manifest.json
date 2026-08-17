@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Safarian",
-  "version": "1.3.0",
-  "description": "An elegant new tab with bookmarks, smart session recovery, and private on-device AI journeys.",
+  "version": "1.4.2",
+  "description": "An elegant new tab with bookmarks, smart session recovery, and local-first AI journeys.",
   "icons": {
     "16": "assets/icons/icon-16.png",
     "32": "assets/icons/icon-32.png",
@@ -33,6 +33,6 @@
     "<all_urls>"
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' https: data:;"
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' https: data:; connect-src https://generativelanguage.googleapis.com;"
   }
 }
