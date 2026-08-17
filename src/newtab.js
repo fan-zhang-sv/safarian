@@ -19,6 +19,7 @@ const CONTINUE_CLOUD_MODEL = "gemini-3.7-flash";
 const CLOUD_AI_READY_MESSAGE = "Smart routing active: one full Flash review per Chrome session, then private on-device updates.";
 const INCREMENTAL_CACHE_VERSION = 2;
 const GEMINI_INTERACTIONS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
+const GEMINI_HOST_PERMISSION = "https://generativelanguage.googleapis.com/*";
 const GEMINI_REQUEST_TIMEOUT = 10000;
 const CLOUD_AI_REFRESH_CLAIM_TTL = 2 * 60 * 1000;
 const CLOUD_FULL_REVIEW_MIN_INTERVAL = 30 * 60 * 1000;
@@ -75,6 +76,8 @@ let trustedLocalStoragePromise = null;
 let volatileCloudAiConfig = null;
 let cloudAiConfigCacheLoaded = false;
 let cloudAiConfigReadPromise = null;
+let geminiHostPermissionState = null;
+let geminiHostPermissionReadPromise = null;
 const storageValueCache = new Map();
 const storageReadPromises = new Map();
 const volatileSessionStorage = new Map();
@@ -217,6 +220,7 @@ const iconColors = [
 
 document.addEventListener("DOMContentLoaded", () => {
   setupStorageCacheInvalidation();
+  setupCloudAiPermissionInvalidation();
   const clearButton = document.querySelector("#clear-recent");
   const recentOrganizeButton = document.querySelector("#recent-organize");
   const recentAiRefreshButton = document.querySelector("#recent-ai-refresh");
@@ -845,13 +849,13 @@ async function setupCloudAiControls() {
   const forgetButton = document.querySelector("#cloud-ai-forget");
   let isReplacing = false;
   let config = await getCloudAiConfig({ includeDisabled: true });
+  const hasCloudAccess = await hasGeminiCloudPermission();
 
-  renderCloudAiControls(config?.enabled ? "cloud" : "local", config);
+  renderCloudAiControls(config?.enabled && hasCloudAccess ? "cloud" : "local", config);
 
   providerButtons.forEach((button) => {
     button.addEventListener("click", async () => {
       const provider = button.dataset.aiProvider;
-      config = await getCloudAiConfig({ includeDisabled: true });
 
       if (provider === "local") {
         isReplacing = false;
@@ -872,8 +876,11 @@ async function setupCloudAiControls() {
 
       if (config?.apiKey) {
         isReplacing = false;
-        config = { ...config, enabled: true };
+        renderCloudAiControls("cloud", config);
         try {
+          setCloudAiStatus("Waiting for Chrome to allow a direct connection to Google Gemini…", "loading");
+          await requestGeminiCloudPermission();
+          config = { ...config, enabled: true };
           await setCloudAiConfigValue(config);
         } catch (error) {
           setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
@@ -917,10 +924,13 @@ async function setupCloudAiControls() {
 
     connectButton.disabled = true;
     connectButton.setAttribute("aria-busy", "true");
-    connectButton.textContent = "Testing securely…";
-    setCloudAiStatus("Checking the key with Flash-Lite without sending browsing data…", "loading");
+    connectButton.textContent = "Connecting securely…";
+    setCloudAiStatus("Waiting for Chrome to allow a direct connection to Google Gemini…", "loading");
 
     try {
+      await requestGeminiCloudPermission();
+      connectButton.textContent = "Testing securely…";
+      setCloudAiStatus("Checking the key with Flash-Lite without sending browsing data…", "loading");
       await testGeminiFlashKey(apiKey);
       const nextConfig = {
         enabled: true,
@@ -957,6 +967,11 @@ async function setupCloudAiControls() {
     } catch (error) {
       setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
       return;
+    }
+    try {
+      await removeGeminiCloudPermission();
+    } catch (error) {
+      console.warn("Unable to remove Gemini host permission", error.message);
     }
     isReplacing = false;
     config = null;
@@ -1007,6 +1022,9 @@ function setCloudAiStatus(message, state = "") {
 }
 
 function cloudAiSetupErrorMessage(error) {
+  if (error?.name === "PermissionDeniedError") {
+    return "Gemini Flash wasn’t enabled. Allow access to Google’s Gemini API when Chrome asks, or keep using on-device AI.";
+  }
   if (error?.name === "PersistentStorageError") {
     return "Chrome couldn’t retain this key in device-local extension storage. Try again or use on-device AI.";
   }
@@ -2157,6 +2175,74 @@ function createGeminiFlashPromptSession(config, model) {
   };
 }
 
+function setupCloudAiPermissionInvalidation() {
+  if (!IS_EXTENSION_CONTEXT || !chrome.permissions) return;
+  const invalidate = () => {
+    geminiHostPermissionState = null;
+    geminiHostPermissionReadPromise = null;
+  };
+  chrome.permissions.onAdded?.addListener(invalidate);
+  chrome.permissions.onRemoved?.addListener(invalidate);
+}
+
+function hasGeminiCloudPermission() {
+  if (!IS_EXTENSION_CONTEXT || !chrome.permissions?.contains) return Promise.resolve(true);
+  if (geminiHostPermissionState !== null) return Promise.resolve(geminiHostPermissionState);
+  if (geminiHostPermissionReadPromise) return geminiHostPermissionReadPromise;
+
+  geminiHostPermissionReadPromise = new Promise((resolve) => {
+    chrome.permissions.contains({ origins: [GEMINI_HOST_PERMISSION] }, (granted) => {
+      const error = chrome.runtime.lastError;
+      if (error) console.warn("Unable to read Gemini host permission", error.message);
+      geminiHostPermissionState = !error && Boolean(granted);
+      resolve(geminiHostPermissionState);
+    });
+  }).finally(() => {
+    geminiHostPermissionReadPromise = null;
+  });
+  return geminiHostPermissionReadPromise;
+}
+
+function requestGeminiCloudPermission() {
+  if (!IS_EXTENSION_CONTEXT || !chrome.permissions?.request) return Promise.resolve(true);
+
+  return new Promise((resolve, reject) => {
+    chrome.permissions.request({ origins: [GEMINI_HOST_PERMISSION] }, (granted) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        const permissionError = new Error(error.message);
+        permissionError.name = "PermissionDeniedError";
+        reject(permissionError);
+        return;
+      }
+      geminiHostPermissionState = Boolean(granted);
+      if (!granted) {
+        const permissionError = new Error("Gemini host access was not granted");
+        permissionError.name = "PermissionDeniedError";
+        reject(permissionError);
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+function removeGeminiCloudPermission() {
+  if (!IS_EXTENSION_CONTEXT || !chrome.permissions?.remove) return Promise.resolve(true);
+
+  return new Promise((resolve, reject) => {
+    chrome.permissions.remove({ origins: [GEMINI_HOST_PERMISSION] }, (removed) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+        return;
+      }
+      geminiHostPermissionState = false;
+      resolve(Boolean(removed));
+    });
+  });
+}
+
 async function testGeminiFlashKey(apiKey) {
   const schema = {
     type: "object",
@@ -2248,6 +2334,7 @@ async function getCloudAiConfig({ includeDisabled = false } = {}) {
   const config = await getCloudAiConfigValue();
   if (!config || typeof config.apiKey !== "string" || !config.apiKey.trim() || !config.keyId) return null;
   if (!includeDisabled && config.enabled !== true) return null;
+  if (!includeDisabled && !(await hasGeminiCloudPermission())) return null;
   return config;
 }
 

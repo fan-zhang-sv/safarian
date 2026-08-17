@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT
 
 node --check src/newtab.js
-node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync('manifest.json','utf8')); if (m.manifest_version !== 3) throw new Error('manifest_version must be 3'); if (!m.chrome_url_overrides || m.chrome_url_overrides.newtab !== 'newtab.html') throw new Error('newtab override missing');"
+node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync('manifest.json','utf8')); if (m.manifest_version !== 3) throw new Error('manifest_version must be 3'); if (!m.chrome_url_overrides || m.chrome_url_overrides.newtab !== 'newtab.html') throw new Error('newtab override missing'); if (m.host_permissions?.length) throw new Error('required host permissions are not allowed'); if (JSON.stringify(m.optional_host_permissions) !== JSON.stringify(['https://generativelanguage.googleapis.com/*'])) throw new Error('Gemini must be the only optional host permission');"
 
 require_size() {
   local path="$1"
