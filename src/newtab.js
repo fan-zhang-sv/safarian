@@ -6,17 +6,30 @@ const BACKGROUND_KEY = "landingBackground";
 const APPEARANCE_KEY = "landingAppearance";
 const THEME_KEY = "landingTheme";
 const ICON_CACHE_KEY = "faviconCache";
+const CONTINUE_CANDIDATE_CACHE_KEY = "continueCandidateData";
 const RECENT_ORGANIZATION_CACHE_KEY = "recentClosedOrganization";
 const CONTINUE_JOURNEY_CACHE_KEY = "continueJourneys";
 const AI_ATTEMPT_STATE_KEY = "browserAiAttemptState";
 const CLOUD_AI_CONFIG_KEY = "geminiCloudConfig";
+const CLOUD_AI_SESSION_REFRESH_KEY = "geminiCloudSessionRefresh";
 const AI_ORGANIZER_LOCK_NAME = "safarian-browser-ai-organizer";
+const CLOUD_AI_REFRESH_LOCK_NAME = "safarian-cloud-ai-refresh-claim";
 const RECENT_CLOUD_MODEL = "gemini-3.5-flash-lite";
 const CONTINUE_CLOUD_MODEL = "gemini-3.7-flash";
+const CLOUD_AI_READY_MESSAGE = "Smart routing active: one full Flash review per Chrome session, then private on-device updates.";
+const INCREMENTAL_CACHE_VERSION = 2;
 const GEMINI_INTERACTIONS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
 const GEMINI_REQUEST_TIMEOUT = 10000;
+const CLOUD_AI_REFRESH_CLAIM_TTL = 2 * 60 * 1000;
+const CLOUD_FULL_REVIEW_MIN_INTERVAL = 30 * 60 * 1000;
 const CLOUD_FALLBACK_CACHE_TTL = 60 * 60 * 1000;
+const INCREMENTAL_BASELINE_TTL = 7 * 24 * 60 * 60 * 1000;
 const ICON_CACHE_TTL = 14 * 24 * 60 * 60 * 1000;
+const ICON_CACHE_WRITE_DELAY = 180;
+const CONTINUE_CANDIDATE_CACHE_TTL = 5 * 60 * 1000;
+const CONTINUE_CANDIDATE_STALE_TTL = 6 * 60 * 60 * 1000;
+const CONTINUE_HISTORY_DETAIL_LIMIT = 36;
+const CONTINUE_HISTORY_CONCURRENCY = 6;
 const RECENT_ORGANIZATION_CACHE_TTL = 6 * 60 * 60 * 1000;
 const CONTINUE_JOURNEY_CACHE_TTL = 12 * 60 * 60 * 1000;
 const CONTINUE_RANGE_DAYS = 30;
@@ -46,6 +59,10 @@ let favoritesRefreshPending = false;
 let favoritesRefreshTimeout = 0;
 let iconCache = null;
 let iconCachePromise = null;
+let iconCacheWriteTimeout = 0;
+let iconCacheWritePromise = Promise.resolve();
+let iconCacheDirty = false;
+let continueCandidateRefreshPromise = null;
 let recentDisplayMode = "smart";
 let recentItemsState = [];
 let recentRenderRequest = 0;
@@ -56,6 +73,11 @@ let browserOrganizerSessionPromise = null;
 let browserOrganizerPromptQueue = Promise.resolve();
 let trustedLocalStoragePromise = null;
 let volatileCloudAiConfig = null;
+let cloudAiConfigCacheLoaded = false;
+let cloudAiConfigReadPromise = null;
+const storageValueCache = new Map();
+const storageReadPromises = new Map();
+const volatileSessionStorage = new Map();
 
 const themePalettes = {
   classic: [
@@ -194,8 +216,11 @@ const iconColors = [
 ];
 
 document.addEventListener("DOMContentLoaded", () => {
+  setupStorageCacheInvalidation();
   const clearButton = document.querySelector("#clear-recent");
   const recentOrganizeButton = document.querySelector("#recent-organize");
+  const recentAiRefreshButton = document.querySelector("#recent-ai-refresh");
+  const continueAiRefreshButton = document.querySelector("#continue-ai-refresh");
   const searchForm = document.querySelector("#search-form");
   const searchInput = document.querySelector("#search-input");
   const recallButton = document.querySelector("#recall-button");
@@ -207,6 +232,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   recentOrganizeButton.addEventListener("click", async () => {
+    if (recentOrganizeButton.disabled) return;
     if (recentDisplayMode === "smart") {
       recentNanoDownloadIntent = null;
       recentDisplayMode = "recent";
@@ -215,12 +241,34 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     recentDisplayMode = "smart";
+    await renderRecentlyClosed();
+  });
+
+  recentAiRefreshButton.addEventListener("click", async () => {
+    if (recentAiRefreshButton.disabled) return;
+    recentDisplayMode = "smart";
     const downloadIntent = {};
     recentNanoDownloadIntent = downloadIntent;
+    setRecentOrganizationBusy(true, "Starting a fresh AI review…");
     try {
       await renderRecentlyClosed({ forceOrganize: true, downloadIntent });
     } finally {
       if (recentNanoDownloadIntent === downloadIntent) recentNanoDownloadIntent = null;
+      if (document.querySelector(".section-recent").classList.contains("is-ai-working")) {
+        setRecentOrganizationBusy(false);
+      } else {
+        setRecentRefreshBusy(false);
+      }
+    }
+  });
+
+  continueAiRefreshButton.addEventListener("click", async () => {
+    if (continueAiRefreshButton.disabled) return;
+    setContinueRefreshBusy(true);
+    try {
+      await renderContinueJourneys({ force: true });
+    } finally {
+      setContinueRefreshBusy(false);
     }
   });
 
@@ -251,6 +299,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   setHeaderText();
   setupCustomizeControls();
+  setupFavoritesListInteractions();
   setupFavoriteEditor();
   setupFavoriteContextMenu();
   setupBookmarkMirrorListeners();
@@ -259,6 +308,7 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 window.addEventListener("pagehide", () => {
+  void flushIconCacheWrites();
   resetBrowserOrganizerSession();
 });
 
@@ -660,11 +710,16 @@ async function loadPage() {
   if (IS_EXTENSION_CONTEXT) {
     renderContinueLoading("Preparing useful journeys from your recent activity…", "pending");
   }
-  await Promise.all([
-    renderRecentlyClosed(),
-    renderFavorites()
-  ]);
-  await renderContinueJourneys();
+  const recentItemsPromise = prepareRecentlyClosedItems().then((items) => {
+    recentItemsState = items;
+    return items;
+  });
+  const favoritesPromise = renderFavorites();
+  const recentRenderPromise = renderRecentlyClosed({ itemsPromise: recentItemsPromise });
+  const continueRenderPromise = Promise.all([recentItemsPromise, favoritesPromise])
+    .then(() => renderContinueJourneys());
+
+  await Promise.all([recentRenderPromise, continueRenderPromise]);
 }
 
 function hasExtensionApis() {
@@ -706,9 +761,15 @@ async function setupCustomizeControls() {
   const clearButton = document.querySelector("#background-clear");
   const fileInput = document.querySelector("#background-file");
 
-  await applyStoredTheme();
-  await applyStoredAppearance();
-  await applyStoredBackground();
+  const [theme, appearance, background] = await Promise.all([
+    getStorageValue(THEME_KEY, "classic"),
+    getStorageValue(APPEARANCE_KEY, "system"),
+    getStorageValue(BACKGROUND_KEY, null),
+    getCloudAiConfig({ includeDisabled: true })
+  ]);
+  applyTheme(theme);
+  applyAppearance(appearance);
+  applyBackground(background);
   await setupCloudAiControls();
 
   themeButtons.forEach((button) => {
@@ -819,7 +880,7 @@ async function setupCloudAiControls() {
           return;
         }
         renderCloudAiControls("cloud", config);
-        setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
+        setCloudAiStatus(CLOUD_AI_READY_MESSAGE, "ready");
         await refreshAiSectionsForProviderChange();
         return;
       }
@@ -879,7 +940,7 @@ async function setupCloudAiControls() {
       isReplacing = false;
       keyInput.value = "";
       renderCloudAiControls("cloud", config);
-      setCloudAiStatus("Connected and remembered on this device. Flash-Lite handles Recent; 3.7 Flash handles Continue.", "ready");
+      setCloudAiStatus(`Connected and remembered on this device. ${CLOUD_AI_READY_MESSAGE}`, "ready");
       await refreshAiSectionsForProviderChange();
     } catch (error) {
       setCloudAiStatus(cloudAiSetupErrorMessage(error), "error");
@@ -932,7 +993,7 @@ function renderCloudAiControls(provider, config) {
   consent.checked = hasKey;
   consent.disabled = hasKey;
   if (provider === "cloud" && hasKey) {
-    setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
+    setCloudAiStatus(CLOUD_AI_READY_MESSAGE, "ready");
   } else if (provider === "cloud") {
     setCloudAiStatus("Add your key to activate cloud AI.");
   }
@@ -1281,7 +1342,7 @@ function imageFileToDataUrl(file) {
   });
 }
 
-async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = null } = {}) {
+async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = null, itemsPromise = null } = {}) {
   const request = ++recentRenderRequest;
   const allowDownload = Boolean(
     forceOrganize &&
@@ -1289,15 +1350,15 @@ async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = nu
     downloadIntent === recentNanoDownloadIntent
   );
   const recentList = document.querySelector("#recent-list");
-  clearChildren(recentList);
+  const preserveExistingGroups = Boolean(
+    !forceOrganize &&
+    recentDisplayMode === "smart" &&
+    recentList.classList.contains("recent-grid-organized") &&
+    recentList.childElementCount
+  );
+  if (!preserveExistingGroups) clearChildren(recentList);
 
-  const clearedAt = await getStorageValue(STORAGE_KEY, 0);
-  const items = await loadRecentlyClosed()
-    .then((sessions) => sessions.map(normalizeSession).filter(Boolean))
-    .then((sessions) => sessions.length ? sessions : (IS_EXTENSION_CONTEXT ? [] : fallbackRecent))
-    .then((sessions) => sessions
-    .filter((item) => item.lastModified > clearedAt)
-    .slice(0, 25));
+  const items = await (itemsPromise || prepareRecentlyClosedItems());
 
   if (request !== recentRenderRequest) return;
 
@@ -1305,11 +1366,12 @@ async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = nu
   updateRecentControls(items);
 
   if (items.length === 0) {
+    clearChildren(recentList);
     renderEmptyPills(recentList);
     return;
   }
 
-  renderRecentChronological(recentList, items.slice(0, MAX_RECENT));
+  if (!preserveExistingGroups) renderRecentChronological(recentList, items.slice(0, MAX_RECENT));
 
   if (SHOW_AI_LOADING_PREVIEW) {
     setRecentOrganizationBusy(true, "AI is reviewing your closed tabs…");
@@ -1326,16 +1388,74 @@ async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = nu
   const organizableItems = items.filter((item) => isHttpUrl(item.url)).slice(0, MAX_RECENT_ORGANIZER_CANDIDATES);
   if (recentDisplayMode !== "smart" || organizableItems.length < 3) return;
 
-  const cloudConfig = await getCloudAiConfig();
+  const [cloudConfig, cached] = await Promise.all([
+    getCloudAiConfig(),
+    getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null)
+  ]);
   const fingerprint = recentOrganizationFingerprint(
     organizableItems,
     aiProviderCacheKey(cloudConfig, RECENT_CLOUD_MODEL)
   );
-  const cached = await getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null);
+  const fullRefreshClaim = forceOrganize || !cloudFullReviewDue(cached)
+    ? null
+    : await claimCloudFullRefresh("recent", cloudConfig);
+  if (request !== recentRenderRequest) {
+    await completeCloudFullRefresh(fullRefreshClaim, "superseded");
+    return;
+  }
   const cachedGroups = hydrateRecentOrganization(cached, fingerprint, organizableItems);
 
-  if (cachedGroups.length && !forceOrganize) {
-    renderOrganizedRecent(recentList, cachedGroups, items.length, cached.provider || "local");
+  if (cachedGroups.length && !forceOrganize && !fullRefreshClaim) {
+    renderOrganizedRecent(recentList, cachedGroups, items.length, cached.provider || "local", cached.fullReviewAt);
+    return;
+  }
+
+  if (cloudConfig && !forceOrganize && !fullRefreshClaim) {
+    const existingGroups = hydrateRecentIncrementalGroups(cached, organizableItems);
+    if (existingGroups.length) {
+      renderOrganizedRecent(
+        recentList,
+        existingGroups,
+        items.length,
+        cached.provider || "cloud",
+        cached.fullReviewAt || cached.createdAt
+      );
+      setRecentOrganizationBusy(true, "Updating with new tabs · existing groups stay available.");
+    }
+    let incremental;
+    let incrementalFailed = false;
+    try {
+      incremental = await updateRecentOrganizationIncrementally(cached, organizableItems, fingerprint);
+    } catch (error) {
+      incrementalFailed = true;
+      console.warn("Gemini recent-tab incremental update failed", describeGeminiError(error));
+      incremental = existingGroups.length
+        ? {
+          groups: existingGroups,
+          provider: cached.provider || "cloud",
+          fullReviewAt: cached.fullReviewAt || cached.createdAt
+        }
+        : null;
+    } finally {
+      if (request === recentRenderRequest && existingGroups.length) setRecentOrganizationBusy(false);
+    }
+    if (request !== recentRenderRequest) return;
+    if (incremental?.groups?.length) {
+      renderOrganizedRecent(
+        recentList,
+        incremental.groups,
+        items.length,
+        incremental.provider,
+        incremental.fullReviewAt
+      );
+      if (incrementalFailed) {
+        setRecentOrganizationNote("Showing the last review · local update will retry.", "ready");
+      }
+      return;
+    }
+    recentDisplayMode = "recent";
+    updateRecentControls(items);
+    setRecentOrganizationNote("Recent order · waiting for the next full Flash review.");
     return;
   }
 
@@ -1347,15 +1467,29 @@ async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = nu
     result = await runRateLimitedAiTask({
       feature: "recent",
       fingerprint,
-      force: forceOrganize,
+      force: forceOrganize || Boolean(fullRefreshClaim),
       loadCached: async () => {
         const latestCache = await getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null);
         const groups = hydrateRecentOrganization(latestCache, fingerprint, organizableItems);
-        return groups.length ? { status: "success", groups, provider: latestCache.provider || "local" } : null;
+        return groups.length
+          ? {
+            status: "success",
+            groups,
+            provider: latestCache.provider || "local",
+            fullReviewAt: latestCache.fullReviewAt
+          }
+          : null;
       },
       saveSuccess: (success) => setStorageValue(
         RECENT_ORGANIZATION_CACHE_KEY,
-        serializeRecentOrganization(fingerprint, success.groups, success.provider, success.fallbackFromCloud)
+        serializeRecentOrganization(
+          fingerprint,
+          success.groups,
+          success.provider,
+          success.fallbackFromCloud,
+          organizableItems,
+          success.fullReviewAt || (success.provider === "cloud" ? Date.now() : null)
+        )
       ),
       task: () => generateRecentOrganization(organizableItems, {
         allowDownload,
@@ -1367,13 +1501,21 @@ async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = nu
     console.warn("Gemini recent-tab orchestration failed", describeGeminiError(error));
     resetBrowserOrganizerSession();
     result = { status: "error", groups: [] };
+  } finally {
+    await completeCloudFullRefresh(fullRefreshClaim, result?.provider || result?.status || "error");
   }
   if (request !== recentRenderRequest) return;
 
   setRecentOrganizationBusy(false);
 
   if (result.status === "success" && result.groups.length) {
-    renderOrganizedRecent(recentList, result.groups, items.length, result.provider || "local");
+    renderOrganizedRecent(
+      recentList,
+      result.groups,
+      items.length,
+      result.provider || "local",
+      result.fullReviewAt || (fullRefreshClaim ? Date.now() : null)
+    );
     return;
   }
 
@@ -1399,12 +1541,15 @@ async function renderRecentlyClosed({ forceOrganize = false, downloadIntent = nu
 function renderRecentChronological(container, items) {
   container.className = "recent-grid";
   clearChildren(container);
-  items.forEach((item) => container.append(createRecentButton(item)));
+  const fragment = document.createDocumentFragment();
+  items.forEach((item) => fragment.append(createRecentButton(item)));
+  container.append(fragment);
 }
 
-function renderOrganizedRecent(container, groups, totalItemCount, provider = "local") {
+function renderOrganizedRecent(container, groups, totalItemCount, provider = "local", fullReviewAt = null) {
   container.className = "recent-grid recent-grid-organized";
   clearChildren(container);
+  const fragment = document.createDocumentFragment();
 
   groups.forEach((group, groupIndex) => {
     const section = document.createElement("section");
@@ -1429,12 +1574,21 @@ function renderOrganizedRecent(container, groups, totalItemCount, provider = "lo
         topPick: groupIndex === 0 && itemIndex === 0
       }));
     });
-    container.append(section);
+    fragment.append(section);
   });
+  container.append(fragment);
 
   updateRecentControls(recentItemsState);
-  const source = provider === "cloud" ? "Organized by Gemini Flash" : "Organized privately on-device";
-  setRecentOrganizationNote(`${source} · ${groups.reduce((sum, group) => sum + group.items.length, 0)} picks from ${totalItemCount}`, "ready");
+  const source = provider === "cloud"
+    ? "Full review by Gemini Flash"
+    : provider === "hybrid"
+      ? "Updated locally after Flash review"
+      : "Organized privately on-device";
+  const reviewAge = fullReviewAt ? ` · full review ${relativeTime(fullReviewAt).toLocaleLowerCase()}` : "";
+  setRecentOrganizationNote(
+    `${source}${reviewAge} · ${groups.reduce((sum, group) => sum + group.items.length, 0)} picks from ${totalItemCount}`,
+    "ready"
+  );
 }
 
 function createRecentButton(item, { reason = "", topPick = false } = {}) {
@@ -1507,14 +1661,27 @@ function createRecentButton(item, { reason = "", topPick = false } = {}) {
 function updateRecentControls(items) {
   const clearButton = document.querySelector("#clear-recent");
   const organizeButton = document.querySelector("#recent-organize");
+  const refreshButton = document.querySelector("#recent-ai-refresh");
+  const busy = document.querySelector(".section-recent").classList.contains("is-ai-working");
   const organizeLabel = organizeButton.querySelector("span");
   const hasItems = items.length > 0;
 
   clearButton.hidden = !hasItems;
   organizeButton.hidden = items.length < 3;
-  organizeButton.setAttribute("aria-busy", "false");
+  refreshButton.hidden = items.length < 3;
+  clearButton.disabled = busy;
+  organizeButton.disabled = busy;
+  refreshButton.disabled = busy;
+  organizeButton.setAttribute("aria-busy", String(busy));
   organizeButton.setAttribute("aria-pressed", String(recentDisplayMode === "smart"));
-  organizeLabel.textContent = recentDisplayMode === "smart" ? "Recent order" : "Organize";
+  organizeButton.setAttribute("aria-label", busy
+    ? "AI is organizing recently closed tabs"
+    : recentDisplayMode === "smart"
+      ? "Show recently closed tabs in chronological order"
+      : "Organize recently closed tabs with AI");
+  organizeLabel.textContent = busy
+    ? "AI working"
+    : recentDisplayMode === "smart" ? "Recent order" : "Organize";
   organizeButton.title = recentDisplayMode === "smart"
     ? "Return to Chrome's chronological order"
     : "Group and rank recently closed tabs with AI";
@@ -1524,13 +1691,26 @@ function updateRecentControls(items) {
   }
 }
 
+function setRecentRefreshBusy(busy) {
+  const button = document.querySelector("#recent-ai-refresh");
+  if (!button) return;
+  button.disabled = busy;
+  button.setAttribute("aria-busy", String(busy));
+  button.setAttribute("aria-label", busy ? "Refreshing AI for recently closed tabs" : "Refresh AI for recently closed tabs");
+  button.querySelector("span").textContent = busy ? "Refreshing…" : "Refresh AI";
+}
+
 function setRecentOrganizationBusy(busy, note = "") {
   const button = document.querySelector("#recent-organize");
+  const clearButton = document.querySelector("#clear-recent");
   const section = document.querySelector(".section-recent");
   const list = document.querySelector("#recent-list");
   button.setAttribute("aria-busy", String(busy));
+  button.disabled = busy;
+  clearButton.disabled = busy;
   section.classList.toggle("is-ai-working", busy);
   list.setAttribute("aria-busy", String(busy));
+  setRecentRefreshBusy(busy);
   if (busy) button.querySelector("span").textContent = "AI working";
   if (!busy) updateRecentControls(recentItemsState);
   if (note) setRecentOrganizationNote(note, busy ? "loading" : "");
@@ -1548,12 +1728,21 @@ function recentOrganizationFingerprint(items, providerKey = "nano") {
 }
 
 function hydrateRecentOrganization(cache, fingerprint, items) {
-  if (!cache || cache.fingerprint !== fingerprint || !Array.isArray(cache.groups)) return [];
+  if (
+    !cache ||
+    cache.incrementalCacheVersion !== INCREMENTAL_CACHE_VERSION ||
+    cache.fingerprint !== fingerprint ||
+    !Array.isArray(cache.groups)
+  ) return [];
   const ttl = cache.fallbackFromCloud ? CLOUD_FALLBACK_CACHE_TTL : RECENT_ORGANIZATION_CACHE_TTL;
   if (Date.now() - Number(cache.createdAt || 0) > ttl) return [];
 
+  return hydrateRecentGroupsData(cache.groups, items);
+}
+
+function hydrateRecentGroupsData(groups, items) {
   const bySessionId = new Map(items.map((item) => [item.sessionId, item]));
-  return cache.groups
+  return (Array.isArray(groups) ? groups : [])
     .map((group) => ({
       label: shortTitle(String(group.label || "Related tabs"), 28),
       items: (Array.isArray(group.items) ? group.items : [])
@@ -1568,20 +1757,172 @@ function hydrateRecentOrganization(cache, fingerprint, items) {
     .slice(0, 3);
 }
 
-function serializeRecentOrganization(fingerprint, groups, provider = "local", fallbackFromCloud = false) {
+function serializeRecentOrganization(
+  fingerprint,
+  groups,
+  provider = "local",
+  fallbackFromCloud = false,
+  candidates = [],
+  fullReviewAt = null,
+  fullReviewGroups = null
+) {
+  const serializedGroups = serializeRecentGroupsData(groups);
+  const serializedFullReviewGroups = Array.isArray(fullReviewGroups)
+    ? serializeRecentGroupsData(fullReviewGroups)
+    : provider === "cloud"
+      ? serializedGroups
+      : null;
   return {
+    incrementalCacheVersion: INCREMENTAL_CACHE_VERSION,
     fingerprint,
     provider,
     fallbackFromCloud,
+    fullReviewAt: Number(fullReviewAt || 0) || null,
+    candidateIds: candidates.map((item) => item.sessionId),
     createdAt: Date.now(),
-    groups: groups.map((group) => ({
+    groups: serializedGroups,
+    fullReviewGroups: serializedFullReviewGroups
+  };
+}
+
+function serializeRecentGroupsData(groups) {
+  return groups.map((group) => ({
       label: group.label,
       items: group.items.map((entry) => ({
         sessionId: entry.item.sessionId,
         reason: entry.reason
       }))
-    }))
+    }));
+}
+
+function hydrateRecentOrganizationLoose(cache, items) {
+  if (
+    !cache ||
+    cache.incrementalCacheVersion !== INCREMENTAL_CACHE_VERSION ||
+    !Array.isArray(cache.groups)
+  ) return [];
+  const ttl = cache.fallbackFromCloud ? CLOUD_FALLBACK_CACHE_TTL : INCREMENTAL_BASELINE_TTL;
+  if (Date.now() - Number(cache.createdAt || 0) > ttl) return [];
+  const compatibleCache = {
+    ...cache,
+    fingerprint: "incremental",
+    createdAt: Date.now(),
+    fallbackFromCloud: false
   };
+  return hydrateRecentOrganization(compatibleCache, "incremental", items);
+}
+
+function hydrateRecentIncrementalGroups(cache, items) {
+  const currentGroups = hydrateRecentOrganizationLoose(cache, items);
+  const fullReviewGroups = hydrateRecentGroupsData(cache?.fullReviewGroups, items);
+  return mergeRecentGroupPatch(fullReviewGroups, currentGroups);
+}
+
+async function updateRecentOrganizationIncrementally(cache, items, fingerprint) {
+  const fullReviewGroups = hydrateRecentGroupsData(cache?.fullReviewGroups, items);
+  const existingGroups = hydrateRecentIncrementalGroups(cache, items);
+  if (!existingGroups.length) return null;
+
+  const baselineIds = new Set(Array.isArray(cache.candidateIds) ? cache.candidateIds : []);
+  const newItems = items.filter((item) => !baselineIds.has(item.sessionId));
+  if (!newItems.length) {
+    return {
+      groups: existingGroups,
+      provider: cache.provider || "cloud",
+      fullReviewAt: cache.fullReviewAt || cache.createdAt
+    };
+  }
+
+  const result = await runRateLimitedAiTask({
+    feature: "recent-incremental",
+    fingerprint,
+    loadCached: async () => {
+      const latest = await getStorageValue(RECENT_ORGANIZATION_CACHE_KEY, null);
+      const groups = hydrateRecentOrganization(latest, fingerprint, items);
+      return groups.length
+        ? { status: "success", groups, provider: latest.provider || "hybrid", fullReviewAt: latest.fullReviewAt }
+        : null;
+    },
+    saveSuccess: (success) => setStorageValue(
+      RECENT_ORGANIZATION_CACHE_KEY,
+      serializeRecentOrganization(
+        fingerprint,
+        success.groups,
+        "hybrid",
+        false,
+        items,
+        cache.fullReviewAt || cache.createdAt,
+        fullReviewGroups.length ? fullReviewGroups : existingGroups
+      )
+    ),
+    task: async () => {
+      const sessionResult = await getBrowserOrganizerSession({ allowDownload: false });
+      if (sessionResult.status !== "success") return { status: sessionResult.status, groups: [] };
+      setRecentOrganizationNote(`On-device AI is reviewing ${newItems.length} new tab${newItems.length === 1 ? "" : "s"}…`, "loading");
+      const patchGroups = await runBrowserOrganizerPrompt(
+        sessionResult.session,
+        (session) => patchRecentSessionsWithGemini(session, existingGroups, newItems, items)
+      );
+      const groups = mergeRecentGroupPatch(existingGroups, patchGroups);
+      return {
+        status: groups.length ? "success" : "empty",
+        groups,
+        provider: "hybrid",
+        fullReviewAt: cache.fullReviewAt || cache.createdAt
+      };
+    }
+  });
+
+  if (result.status === "success" && result.groups.length) return result;
+  const newGroup = {
+    label: "New since review",
+    items: newItems.slice(0, 3).map((item) => ({ item, reason: "Closed since the last full review" }))
+  };
+  return {
+    groups: [newGroup, ...existingGroups].filter((group) => group.items.length).slice(0, 3),
+    provider: cache.provider || "cloud",
+    fullReviewAt: cache.fullReviewAt || cache.createdAt
+  };
+}
+
+function mergeRecentGroupPatch(existingGroups, patchGroups) {
+  const existing = Array.isArray(existingGroups) ? existingGroups : [];
+  const patches = Array.isArray(patchGroups) ? patchGroups.filter((group) => group.items?.length) : [];
+  if (!existing.length) return patches.slice(0, 3);
+  if (!patches.length) return existing.slice(0, 3);
+
+  const usedPatches = new Set();
+  const merged = existing.map((group) => {
+    const existingIds = new Set(group.items.map((entry) => entry.item.sessionId));
+    const patchIndex = patches.findIndex((patch, index) => {
+      if (usedPatches.has(index)) return false;
+      if (normalizeRecallText(patch.label) === normalizeRecallText(group.label)) return true;
+      return patch.items.some((entry) => existingIds.has(entry.item.sessionId));
+    });
+    if (patchIndex < 0) return group;
+    usedPatches.add(patchIndex);
+    return patches[patchIndex];
+  });
+
+  patches.forEach((patch, index) => {
+    if (usedPatches.has(index)) return;
+    if (merged.length < 3) merged.push(patch);
+    else merged[merged.length - 1] = patch;
+  });
+
+  const seen = new Set();
+  return merged
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((entry) => {
+        const id = entry.item.sessionId;
+        if (!id || seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      }).slice(0, 3)
+    }))
+    .filter((group) => group.items.length)
+    .slice(0, 3);
 }
 
 async function runRateLimitedAiTask({
@@ -1774,8 +2115,13 @@ async function generateRecentOrganization(items, { allowDownload, cloudConfig, o
         createGeminiFlashPromptSession(cloudConfig, RECENT_CLOUD_MODEL),
         items
       );
-      setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
-      return { status: groups.length ? "success" : "empty", groups, provider: "cloud" };
+      setCloudAiStatus(CLOUD_AI_READY_MESSAGE, "ready");
+      return {
+        status: groups.length ? "success" : "empty",
+        groups,
+        provider: "cloud",
+        fullReviewAt: Date.now()
+      };
     } catch (error) {
       fallbackFromCloud = true;
       console.warn("Gemini Flash tab organization failed", describeGeminiError(error));
@@ -1905,6 +2251,62 @@ async function getCloudAiConfig({ includeDisabled = false } = {}) {
   return config;
 }
 
+function cloudFullReviewDue(cache) {
+  if (cache?.incrementalCacheVersion !== INCREMENTAL_CACHE_VERSION) return true;
+  const lastFullReview = Number(cache?.fullReviewAt || 0);
+  return !lastFullReview || Date.now() - lastFullReview >= CLOUD_FULL_REVIEW_MIN_INTERVAL;
+}
+
+async function claimCloudFullRefresh(feature, cloudConfig) {
+  if (!cloudConfig) return null;
+  const claimKey = `${feature}:${cloudConfig.keyId}:${cloudConfig.routingVersion || 1}`;
+  const claim = async () => {
+    const state = await getSessionStorageValue(CLOUD_AI_SESSION_REFRESH_KEY, {});
+    const previous = state?.[claimKey];
+    const now = Date.now();
+    if (
+      previous?.status === "complete" ||
+      (previous?.status === "running" && now - Number(previous.claimedAt || 0) < CLOUD_AI_REFRESH_CLAIM_TTL)
+    ) {
+      return null;
+    }
+
+    const token = globalThis.crypto?.randomUUID?.() || `${now}-${Math.random()}`;
+    const stored = await setSessionStorageValue(CLOUD_AI_SESSION_REFRESH_KEY, {
+      ...(state && typeof state === "object" ? state : {}),
+      [claimKey]: { status: "running", claimedAt: now, token }
+    });
+    if (!stored) return null;
+    const verified = await getSessionStorageValue(CLOUD_AI_SESSION_REFRESH_KEY, {});
+    if (verified?.[claimKey]?.token !== token) return null;
+    return { claimKey, token };
+  };
+
+  if (!IS_EXTENSION_CONTEXT || !navigator.locks?.request) return claim();
+  return navigator.locks.request(CLOUD_AI_REFRESH_LOCK_NAME, { mode: "exclusive" }, claim);
+}
+
+async function completeCloudFullRefresh(claim, outcome = "complete") {
+  if (!claim) return;
+  const state = await getSessionStorageValue(CLOUD_AI_SESSION_REFRESH_KEY, {});
+  if (state?.[claim.claimKey]?.token !== claim.token) return;
+  if (outcome === "superseded") {
+    const nextState = { ...state };
+    delete nextState[claim.claimKey];
+    await setSessionStorageValue(CLOUD_AI_SESSION_REFRESH_KEY, nextState);
+    return;
+  }
+  await setSessionStorageValue(CLOUD_AI_SESSION_REFRESH_KEY, {
+    ...state,
+    [claim.claimKey]: {
+      status: "complete",
+      claimedAt: state[claim.claimKey].claimedAt,
+      completedAt: Date.now(),
+      outcome
+    }
+  });
+}
+
 function aiProviderCacheKey(cloudConfig, model) {
   return cloudConfig ? `flash:${model}:${cloudConfig.keyId}` : "nano";
 }
@@ -1992,6 +2394,73 @@ async function rankRecentSessionsWithGemini(session, items) {
     responseConstraint: schema,
     omitResponseConstraintInput: true
   });
+  return parseRecentGroups(response, items);
+}
+
+async function patchRecentSessionsWithGemini(session, existingGroups, newItems, currentItems) {
+  const relevantIds = new Set([
+    ...existingGroups.flatMap((group) => group.items.map((entry) => entry.item.sessionId)),
+    ...newItems.map((item) => item.sessionId)
+  ]);
+  const relevantItems = currentItems.filter((item) => relevantIds.has(item.sessionId));
+  const indexBySessionId = new Map(relevantItems.map((item, index) => [item.sessionId, index]));
+  const existingLines = existingGroups.map((group) => {
+    const ids = group.items
+      .map((entry) => indexBySessionId.get(entry.item.sessionId))
+      .filter(Number.isInteger);
+    return `${group.label}: [${ids.join(",")}]`;
+  }).join("\n");
+  const newLines = newItems.map((item) => {
+    const id = indexBySessionId.get(item.sessionId);
+    return `${id} | ${shortTitle(item.title, 68)} | ${hostnameFor(item.url)} | ${relativeTime(item.lastModified)}`;
+  }).join("\n");
+  const schema = recentGroupsSchema(relevantItems.length);
+  const prompt = [
+    "Incrementally update the user's existing recently closed task groups using only the newly closed tabs.",
+    "Keep the existing groups unchanged unless a new tab is genuinely useful enough to add, replace, or reorder.",
+    "Return only groups that need changes. Omitted existing groups are preserved automatically by Safarian.",
+    "Return at most three groups and three items per group. Use only the numeric IDs provided. Do not invent tabs.",
+    'Output shape: {"groups":[{"label":"Task name","items":[0,1]}]}',
+    "Existing groups:",
+    existingLines || "None",
+    "Newly closed tabs:",
+    newLines
+  ].join("\n\n");
+  const response = await session.prompt(prompt, {
+    responseConstraint: schema,
+    omitResponseConstraintInput: true
+  });
+  return parseRecentGroups(response, relevantItems);
+}
+
+function recentGroupsSchema(itemCount) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["groups"],
+    properties: {
+      groups: {
+        type: "array",
+        maxItems: 3,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["label", "items"],
+          properties: {
+            label: { type: "string" },
+            items: {
+              type: "array",
+              maxItems: 3,
+              items: { type: "integer", minimum: 0, maximum: Math.max(0, itemCount - 1) }
+            }
+          }
+        }
+      }
+    }
+  };
+}
+
+function parseRecentGroups(response, items) {
   const parsed = parseGeminiJson(response);
   const seen = new Set();
 
@@ -2019,6 +2488,18 @@ async function rankRecentSessionsWithGemini(session, items) {
 async function loadRecentlyClosed() {
   if (!IS_EXTENSION_CONTEXT) return fallbackRecent;
   return callChrome(chrome.sessions.getRecentlyClosed, { maxResults: 25 });
+}
+
+async function prepareRecentlyClosedItems() {
+  const [clearedAt, sessions] = await Promise.all([
+    getStorageValue(STORAGE_KEY, 0),
+    loadRecentlyClosed()
+  ]);
+  const normalized = sessions.map(normalizeSession).filter(Boolean);
+  const available = normalized.length ? normalized : (IS_EXTENSION_CONTEXT ? [] : fallbackRecent);
+  return available
+    .filter((item) => item.lastModified > clearedAt)
+    .slice(0, 25);
 }
 
 function normalizeSession(session) {
@@ -2073,6 +2554,7 @@ async function renderFavorites() {
     return;
   }
 
+  const fragment = document.createDocumentFragment();
   favorites.forEach((bookmark, index) => {
     const item = document.createElement("div");
     item.className = "favorite-item";
@@ -2081,36 +2563,6 @@ async function renderFavorites() {
     item.draggable = false;
     item.dataset.index = String(index);
     item.title = `${bookmark.title || hostnameFor(bookmark.url)}\n${bookmark.url}`;
-    item.addEventListener("dragstart", (event) => {
-      event.preventDefault();
-    });
-    item.addEventListener("contextmenu", (event) => {
-      showFavoriteMenu(event, index);
-    });
-    item.addEventListener("pointerdown", (event) => {
-      startFavoritePointerReorder(event, index);
-    });
-
-    item.addEventListener("click", (event) => {
-      if (suppressFavoriteClick) {
-        event.preventDefault();
-        suppressFavoriteClick = false;
-        return;
-      }
-
-      if (favoritesEditMode) {
-        event.preventDefault();
-        return;
-      }
-
-      window.location.href = bookmark.url;
-    });
-
-    item.addEventListener("keydown", (event) => {
-      if (favoritesEditMode || (event.key !== "Enter" && event.key !== " ")) return;
-      event.preventDefault();
-      window.location.href = bookmark.url;
-    });
 
     const iconWrap = document.createElement("span");
     iconWrap.className = "favorite-icon";
@@ -2148,7 +2600,50 @@ async function renderFavorites() {
 
     img.draggable = false;
     iconWrap.append(img);
-    favoritesList.append(item);
+    fragment.append(item);
+  });
+  favoritesList.append(fragment);
+}
+
+function setupFavoritesListInteractions() {
+  const favoritesList = document.querySelector("#favorites-list");
+  const favoriteFromEvent = (event) => event.target.closest(".favorite-item[data-index]");
+
+  favoritesList.addEventListener("dragstart", (event) => {
+    if (favoriteFromEvent(event)) event.preventDefault();
+  });
+  favoritesList.addEventListener("contextmenu", (event) => {
+    const item = favoriteFromEvent(event);
+    if (!item) return;
+    showFavoriteMenu(event, Number(item.dataset.index));
+  });
+  favoritesList.addEventListener("pointerdown", (event) => {
+    const item = favoriteFromEvent(event);
+    if (!item) return;
+    startFavoritePointerReorder(event, Number(item.dataset.index), item);
+  });
+  favoritesList.addEventListener("click", (event) => {
+    const item = favoriteFromEvent(event);
+    if (!item) return;
+    if (suppressFavoriteClick) {
+      event.preventDefault();
+      suppressFavoriteClick = false;
+      return;
+    }
+    if (favoritesEditMode) {
+      event.preventDefault();
+      return;
+    }
+    const favorite = favoritesState[Number(item.dataset.index)];
+    if (favorite?.url) window.location.href = favorite.url;
+  });
+  favoritesList.addEventListener("keydown", (event) => {
+    const item = favoriteFromEvent(event);
+    if (!item || favoritesEditMode || (event.key !== "Enter" && event.key !== " ")) return;
+    const favorite = favoritesState[Number(item.dataset.index)];
+    if (!favorite?.url) return;
+    event.preventDefault();
+    window.location.href = favorite.url;
   });
 }
 
@@ -2186,13 +2681,12 @@ function normalizeFavoriteUrl(value) {
   return trimmed;
 }
 
-function startFavoritePointerReorder(event, index) {
+function startFavoritePointerReorder(event, index, item = event.currentTarget) {
   if (event.button !== 0 || favoriteDrag) return;
 
   event.preventDefault();
   hideFavoriteMenu();
 
-  const item = event.currentTarget;
   const rect = item.getBoundingClientRect();
 
   favoriteDrag = {
@@ -2474,17 +2968,27 @@ async function moveFavorite(fromIndex, toIndex) {
 async function renderContinueJourneys({ force = false } = {}) {
   const request = ++continueRenderRequest;
   const badgeLabel = document.querySelector("#continue-badge-label");
-  renderContinueLoading("Preparing useful journeys from your recent activity…", "pending");
+  const hasExistingCards = Boolean(document.querySelector("#continue-list .journey-card:not(.journey-card-loading)"));
+  if (force || !hasExistingCards) {
+    renderContinueLoading("Preparing useful journeys from your recent activity…", "pending");
+  } else {
+    setContinueContentRefreshBusy(true, "Checking for new activity · existing journeys stay available.");
+  }
 
   if (SHOW_AI_LOADING_PREVIEW) {
     setContinueLoadingMessage("AI is connecting related pages into useful journeys…");
     return;
   }
 
-  const cloudConfig = IS_EXTENSION_CONTEXT ? await getCloudAiConfig() : null;
+  const cloudConfigPromise = IS_EXTENSION_CONTEXT ? getCloudAiConfig() : Promise.resolve(null);
+  const candidatesPromise = loadContinueCandidates({ forceRefresh: force });
+  const journeyCachePromise = IS_EXTENSION_CONTEXT
+    ? getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null)
+    : Promise.resolve(null);
+  const cloudConfig = await cloudConfigPromise;
   if (request !== continueRenderRequest) return;
 
-  if (IS_EXTENSION_CONTEXT) {
+  if (IS_EXTENSION_CONTEXT && (force || !hasExistingCards)) {
     renderContinueLoading(
       cloudConfig
         ? "Gemini 3.7 Flash is checking your recent activity for work worth resuming…"
@@ -2493,7 +2997,7 @@ async function renderContinueJourneys({ force = false } = {}) {
     );
   }
 
-  const candidates = await loadContinueCandidates();
+  const candidates = await candidatesPromise;
   if (request !== continueRenderRequest) return;
   if (candidates.length < 2) {
     renderContinueEmpty(
@@ -2513,11 +3017,69 @@ async function renderContinueJourneys({ force = false } = {}) {
     candidates,
     aiProviderCacheKey(cloudConfig, CONTINUE_CLOUD_MODEL)
   );
-  const cached = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
+  const cached = await journeyCachePromise;
   if (request !== continueRenderRequest) return;
+  const fullRefreshClaim = force || !cloudFullReviewDue(cached)
+    ? null
+    : await claimCloudFullRefresh("continue", cloudConfig);
+  if (request !== continueRenderRequest) {
+    await completeCloudFullRefresh(fullRefreshClaim, "superseded");
+    return;
+  }
   const cachedJourneys = hydrateContinueJourneys(cached, fingerprint, candidates);
-  if (cachedJourneys.length && !force) {
-    renderContinueJourneyCards(cachedJourneys, cached.provider || "local");
+  if (cachedJourneys.length && !force && !fullRefreshClaim) {
+    renderContinueJourneyCards(
+      cachedJourneys,
+      cached.provider || "local",
+      cached.fullReviewAt
+    );
+    return;
+  }
+
+  if (cloudConfig && !force && !fullRefreshClaim) {
+    const existingJourneys = hydrateContinueIncrementalJourneys(cached, candidates);
+    if (existingJourneys.length) {
+      renderContinueJourneyCards(
+        existingJourneys,
+        cached.provider || "cloud",
+        cached.fullReviewAt || cached.createdAt
+      );
+      setContinueContentRefreshBusy(true, "Updating with new activity · existing journeys stay available.");
+    }
+    let incremental;
+    let incrementalFailed = false;
+    try {
+      incremental = await updateContinueJourneysIncrementally(cached, candidates, fingerprint);
+    } catch (error) {
+      incrementalFailed = true;
+      console.warn("Gemini Continue incremental update failed", describeGeminiError(error));
+      incremental = existingJourneys.length
+        ? {
+          journeys: existingJourneys,
+          provider: cached.provider || "cloud",
+          fullReviewAt: cached.fullReviewAt || cached.createdAt
+        }
+        : null;
+    } finally {
+      if (request === continueRenderRequest && existingJourneys.length) setContinueContentRefreshBusy(false);
+    }
+    if (request !== continueRenderRequest) return;
+    if (incremental?.journeys?.length) {
+      renderContinueJourneyCards(
+        incremental.journeys,
+        incremental.provider,
+        incremental.fullReviewAt
+      );
+      if (incrementalFailed) {
+        document.querySelector("#continue-subtitle").textContent = "Showing the last review · local update will retry";
+        document.querySelector("#continue-badge-label").textContent = "Last review";
+      }
+      return;
+    }
+    renderContinueEmpty(
+      "The last full Flash review has no active journey left. Safarian will refresh it at the next Chrome start.",
+      "Waiting for refresh"
+    );
     return;
   }
 
@@ -2525,17 +3087,32 @@ async function renderContinueJourneys({ force = false } = {}) {
     const result = await runRateLimitedAiTask({
       feature: "continue",
       fingerprint,
-      force,
+      force: force || Boolean(fullRefreshClaim),
       loadCached: async () => {
         const latestCache = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
         const journeys = hydrateContinueJourneys(latestCache, fingerprint, candidates);
-        return journeys.length ? { status: "success", journeys, provider: latestCache.provider || "local" } : null;
+        return journeys.length
+          ? {
+            status: "success",
+            journeys,
+            provider: latestCache.provider || "local",
+            fullReviewAt: latestCache.fullReviewAt
+          }
+          : null;
       },
       saveSuccess: (success) => setStorageValue(
         CONTINUE_JOURNEY_CACHE_KEY,
-        serializeContinueJourneys(fingerprint, success.journeys, success.provider, success.fallbackFromCloud)
+        serializeContinueJourneys(
+          fingerprint,
+          success.journeys,
+          success.provider,
+          success.fallbackFromCloud,
+          candidates,
+          success.fullReviewAt || (success.provider === "cloud" ? Date.now() : null)
+        )
       ),
       task: () => generateContinueJourneys(candidates, {
+        allowDownload: force,
         cloudConfig,
         onStatus: setContinueLoadingMessage
       })
@@ -2545,7 +3122,11 @@ async function renderContinueJourneys({ force = false } = {}) {
       renderContinueEmpty(continueEmptyMessage(result), continueEmptyBadge(result));
       return;
     }
-    renderContinueJourneyCards(result.journeys, result.provider || "local");
+    renderContinueJourneyCards(
+      result.journeys,
+      result.provider || "local",
+      result.fullReviewAt || (fullRefreshClaim ? Date.now() : null)
+    );
   } catch (error) {
     console.warn("Gemini Continue grouping failed", describeGeminiError(error));
     resetBrowserOrganizerSession();
@@ -2554,6 +3135,8 @@ async function renderContinueJourneys({ force = false } = {}) {
       "Continue couldn’t refresh this time. Safarian will try again automatically.",
       "Retrying later"
     );
+  } finally {
+    await completeCloudFullRefresh(fullRefreshClaim, "complete");
   }
 }
 
@@ -2589,8 +3172,10 @@ function renderContinueLoading(message, provider = "local") {
   const activePalette = themePalettes[currentTheme] || themePalettes.classic;
 
   section.hidden = false;
+  section.classList.remove("is-ai-updating");
   section.classList.add("is-ai-working");
   section.setAttribute("aria-busy", "true");
+  setContinueRefreshBusy(true);
   badgeLabel.textContent = provider === "cloud"
     ? "Gemini Flash working"
     : provider === "local"
@@ -2598,6 +3183,7 @@ function renderContinueLoading(message, provider = "local") {
       : "AI preparing";
   setContinueLoadingMessage(message);
   clearChildren(list);
+  const fragment = document.createDocumentFragment();
 
   for (let index = 0; index < 3; index += 1) {
     const colors = activePalette[index % activePalette.length];
@@ -2648,7 +3234,29 @@ function renderContinueLoading(message, provider = "local") {
     footer.append(btn);
 
     card.append(header, heading, pagesList, footer);
-    list.append(card);
+    fragment.append(card);
+  }
+  list.append(fragment);
+}
+
+function setContinueRefreshBusy(busy) {
+  const button = document.querySelector("#continue-ai-refresh");
+  if (!button) return;
+  button.disabled = busy;
+  button.setAttribute("aria-busy", String(busy));
+  button.setAttribute("aria-label", busy ? "Refreshing AI for Continue" : "Refresh AI for Continue");
+  button.querySelector("span").textContent = busy ? "Refreshing…" : "Refresh AI";
+}
+
+function setContinueContentRefreshBusy(busy, message = "") {
+  const section = document.querySelector("#continue-section");
+  section.classList.toggle("is-ai-working", busy);
+  section.classList.toggle("is-ai-updating", busy);
+  section.setAttribute("aria-busy", String(busy));
+  setContinueRefreshBusy(busy);
+  if (busy) {
+    document.querySelector("#continue-badge-label").textContent = "Updating locally";
+    if (message) setContinueLoadingMessage(message);
   }
 }
 
@@ -2662,7 +3270,9 @@ function renderContinueEmpty(message, badge = "Waiting for signal") {
   const list = document.querySelector("#continue-list");
   section.hidden = false;
   section.classList.remove("is-ai-working");
+  section.classList.remove("is-ai-updating");
   section.setAttribute("aria-busy", "false");
+  setContinueRefreshBusy(false);
   document.querySelector("#continue-subtitle").textContent = "Useful journeys appear only when there’s a strong signal";
   document.querySelector("#continue-badge-label").textContent = badge;
   clearChildren(list);
@@ -2679,14 +3289,41 @@ function renderContinueEmpty(message, badge = "Waiting for signal") {
   list.append(state);
 }
 
-async function loadContinueCandidates() {
+async function loadContinueCandidates({ forceRefresh = false } = {}) {
   if (!IS_EXTENSION_CONTEXT) return previewContinueCandidates();
 
+  const cached = normalizeContinueCandidateCache(
+    await getStorageValue(CONTINUE_CANDIDATE_CACHE_KEY, null)
+  );
+  const cacheAge = cached ? Date.now() - cached.createdAt : Infinity;
+  if (!forceRefresh && cached && cacheAge <= CONTINUE_CANDIDATE_STALE_TTL) {
+    if (cacheAge > CONTINUE_CANDIDATE_CACHE_TTL) scheduleContinueCandidateRefresh();
+    return selectContinueCandidates(cached.items);
+  }
+
+  const items = continueCandidateRefreshPromise
+    ? await continueCandidateRefreshPromise
+    : await refreshContinueCandidateData();
+  return selectContinueCandidates(items);
+}
+
+function scheduleContinueCandidateRefresh() {
+  if (continueCandidateRefreshPromise) return continueCandidateRefreshPromise;
+  continueCandidateRefreshPromise = new Promise((resolve) => {
+    const run = () => resolve(refreshContinueCandidateData());
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(run, { timeout: 1200 });
+    } else {
+      window.setTimeout(run, 180);
+    }
+  }).finally(() => {
+    continueCandidateRefreshPromise = null;
+  });
+  return continueCandidateRefreshPromise;
+}
+
+async function refreshContinueCandidateData() {
   const startTime = Date.now() - CONTINUE_RANGE_DAYS * 24 * 60 * 60 * 1000;
-  const excludedUrls = new Set([
-    ...favoritesState.map((item) => journeyUrlKey(item.url)),
-    ...recentItemsState.map((item) => journeyUrlKey(item.url))
-  ].filter(Boolean));
   const history = await callChrome(chrome.history.search, {
     text: "",
     startTime,
@@ -2704,29 +3341,67 @@ async function loadContinueCandidates() {
     })
     .forEach((item) => {
       const key = journeyUrlKey(item.url);
-      if (!key || excludedUrls.has(key) || byUrl.has(key)) return;
+      if (!key || byUrl.has(key)) return;
       byUrl.set(key, item);
     });
 
-  const detailed = await Promise.all([...byUrl.values()].slice(0, 36).map(async (item) => {
-    const visits = await callChrome(chrome.history.getVisits, { url: item.url });
-    const recentVisits = visits
-      .map((visit) => Number(visit.visitTime || 0))
-      .filter((visitTime) => visitTime >= startTime);
-    const visitDays = [...new Set(recentVisits.map(dayKeyForTimestamp))];
-    const lastVisitTime = Math.max(item.lastVisitTime || 0, ...recentVisits, 0);
+  const detailed = await mapWithConcurrency(
+    [...byUrl.values()].slice(0, CONTINUE_HISTORY_DETAIL_LIMIT),
+    CONTINUE_HISTORY_CONCURRENCY,
+    async (item) => {
+      const visits = await callChrome(chrome.history.getVisits, { url: item.url });
+      const recentVisits = visits
+        .map((visit) => Number(visit.visitTime || 0))
+        .filter((visitTime) => visitTime >= startTime);
+      const visitDays = [...new Set(recentVisits.map(dayKeyForTimestamp))];
+      const lastVisitTime = Math.max(item.lastVisitTime || 0, ...recentVisits, 0);
 
-    return {
-      title: readableTitle(item.title, item.url),
+      return {
+        title: readableTitle(item.title, item.url),
+        url: item.url,
+        lastVisitTime,
+        visitCount: recentVisits.length,
+        typedCount: item.typedCount || 0,
+        visitDays
+      };
+    }
+  );
+
+  void setStorageValue(CONTINUE_CANDIDATE_CACHE_KEY, {
+    version: 1,
+    createdAt: Date.now(),
+    items: detailed
+  });
+  return detailed;
+}
+
+function normalizeContinueCandidateCache(value) {
+  if (!value || value.version !== 1 || !Array.isArray(value.items)) return null;
+  const items = value.items
+    .filter((item) => item && isHttpUrl(item.url))
+    .map((item) => ({
+      title: String(item.title || ""),
       url: item.url,
-      lastVisitTime,
-      visitCount: recentVisits.length,
-      typedCount: item.typedCount || 0,
-      visitDays
-    };
-  }));
+      lastVisitTime: Number(item.lastVisitTime || 0),
+      visitCount: Number(item.visitCount || 0),
+      typedCount: Number(item.typedCount || 0),
+      visitDays: Array.isArray(item.visitDays) ? item.visitDays.filter(Boolean).slice(0, CONTINUE_RANGE_DAYS) : []
+    }))
+    .slice(0, CONTINUE_HISTORY_DETAIL_LIMIT);
+  return {
+    createdAt: Number(value.createdAt || 0),
+    items
+  };
+}
+
+function selectContinueCandidates(detailed) {
+  const excludedUrls = new Set([
+    ...favoritesState.map((item) => journeyUrlKey(item.url)),
+    ...recentItemsState.map((item) => journeyUrlKey(item.url))
+  ].filter(Boolean));
 
   return detailed
+    .filter((item) => !excludedUrls.has(journeyUrlKey(item.url)))
     .filter((item) => item.visitCount >= 2 && item.visitDays.length >= 2)
     .map((item) => ({
       ...item,
@@ -2737,6 +3412,20 @@ async function loadContinueCandidates() {
     }))
     .sort((a, b) => b.score - a.score || b.lastVisitTime - a.lastVisitTime)
     .slice(0, MAX_CONTINUE_CANDIDATES);
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function previewContinueCandidates() {
@@ -2821,6 +3510,74 @@ async function rankContinueJourneysWithGemini(session, candidates) {
     responseConstraint: schema,
     omitResponseConstraintInput: true
   });
+  return parseContinueJourneys(response, candidates);
+}
+
+async function patchContinueJourneysWithGemini(session, existingJourneys, changedCandidates, candidates) {
+  const relevantUrls = new Set([
+    ...existingJourneys.flatMap((journey) => journey.items.map((item) => journeyUrlKey(item.url))),
+    ...changedCandidates.map((item) => journeyUrlKey(item.url))
+  ]);
+  const relevantCandidates = candidates.filter((item) => relevantUrls.has(journeyUrlKey(item.url)));
+  const indexByUrl = new Map(relevantCandidates.map((item, index) => [journeyUrlKey(item.url), index]));
+  const existingLines = existingJourneys.map((journey) => {
+    const ids = journey.items
+      .map((item) => indexByUrl.get(journeyUrlKey(item.url)))
+      .filter(Number.isInteger);
+    return `${journey.label}: [${ids.join(",")}]`;
+  }).join("\n");
+  const changedLines = changedCandidates.map((item) => {
+    const id = indexByUrl.get(journeyUrlKey(item.url));
+    return `${id} | ${shortTitle(item.title, 68)} | ${hostnameFor(item.url)}${recallSafePath(item.url)} | ${item.visitCount} visits | ${item.visitDays.length} days`;
+  }).join("\n");
+  const schema = continueJourneysSchema(relevantCandidates.length);
+  const prompt = [
+    "Incrementally update the user's existing ongoing journeys using only new or changed browsing activity.",
+    "Keep an existing journey unchanged unless the changed pages strengthen, weaken, or clearly belong to it.",
+    "Return only journeys that need changes. Omitted existing journeys are preserved automatically by Safarian.",
+    "A journey must still contain at least two pages supporting the same concrete goal. Omit weak groupings.",
+    "Return at most three journeys and use only the numeric IDs provided. Return JSON only.",
+    'Output shape: {"journeys":[{"label":"Project name","items":[0,1]}]}',
+    "Existing journeys:",
+    existingLines || "None",
+    "New or changed activity:",
+    changedLines
+  ].join("\n\n");
+  const response = await session.prompt(prompt, {
+    responseConstraint: schema,
+    omitResponseConstraintInput: true
+  });
+  return parseContinueJourneys(response, relevantCandidates);
+}
+
+function continueJourneysSchema(candidateCount) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["journeys"],
+    properties: {
+      journeys: {
+        type: "array",
+        maxItems: 3,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["label", "items"],
+          properties: {
+            label: { type: "string" },
+            items: {
+              type: "array",
+              maxItems: 4,
+              items: { type: "integer", minimum: 0, maximum: Math.max(0, candidateCount - 1) }
+            }
+          }
+        }
+      }
+    }
+  };
+}
+
+function parseContinueJourneys(response, candidates) {
   const parsed = parseGeminiJson(response);
   const seen = new Set();
 
@@ -2840,7 +3597,7 @@ async function rankContinueJourneysWithGemini(session, candidates) {
     }, []);
 }
 
-async function generateContinueJourneys(candidates, { cloudConfig, onStatus }) {
+async function generateContinueJourneys(candidates, { allowDownload = false, cloudConfig, onStatus }) {
   let fallbackFromCloud = false;
   if (cloudConfig) {
     try {
@@ -2849,8 +3606,13 @@ async function generateContinueJourneys(candidates, { cloudConfig, onStatus }) {
         createGeminiFlashPromptSession(cloudConfig, CONTINUE_CLOUD_MODEL),
         candidates
       );
-      setCloudAiStatus("Smart routing active: Flash-Lite for Recent, 3.7 Flash for Continue.", "ready");
-      return { status: journeys.length ? "success" : "empty", journeys, provider: "cloud" };
+      setCloudAiStatus(CLOUD_AI_READY_MESSAGE, "ready");
+      return {
+        status: journeys.length ? "success" : "empty",
+        journeys,
+        provider: "cloud",
+        fullReviewAt: Date.now()
+      };
     } catch (error) {
       fallbackFromCloud = true;
       console.warn("Gemini Flash Continue grouping failed", describeGeminiError(error));
@@ -2859,7 +3621,7 @@ async function generateContinueJourneys(candidates, { cloudConfig, onStatus }) {
     }
   }
 
-  const sessionResult = await getBrowserOrganizerSession({ allowDownload: false });
+  const sessionResult = await getBrowserOrganizerSession({ allowDownload });
   if (sessionResult.status !== "success") {
     return { status: sessionResult.status, journeys: [] };
   }
@@ -2885,12 +3647,21 @@ function continueJourneyFingerprint(candidates, providerKey = "nano") {
 }
 
 function hydrateContinueJourneys(cache, fingerprint, candidates) {
-  if (!cache || cache.fingerprint !== fingerprint || !Array.isArray(cache.journeys)) return [];
+  if (
+    !cache ||
+    cache.incrementalCacheVersion !== INCREMENTAL_CACHE_VERSION ||
+    cache.fingerprint !== fingerprint ||
+    !Array.isArray(cache.journeys)
+  ) return [];
   const ttl = cache.fallbackFromCloud ? CLOUD_FALLBACK_CACHE_TTL : CONTINUE_JOURNEY_CACHE_TTL;
   if (Date.now() - Number(cache.createdAt || 0) > ttl) return [];
 
+  return hydrateContinueJourneysData(cache.journeys, candidates);
+}
+
+function hydrateContinueJourneysData(journeys, candidates) {
   const byUrl = new Map(candidates.map((item) => [journeyUrlKey(item.url), item]));
-  return cache.journeys
+  return (Array.isArray(journeys) ? journeys : [])
     .map((journey) => ({
       label: shortTitle(String(journey.label || "Ongoing project"), 30),
       items: (Array.isArray(journey.urls) ? journey.urls : [])
@@ -2902,20 +3673,181 @@ function hydrateContinueJourneys(cache, fingerprint, candidates) {
     .slice(0, 3);
 }
 
-function serializeContinueJourneys(fingerprint, journeys, provider = "local", fallbackFromCloud = false) {
+function serializeContinueJourneys(
+  fingerprint,
+  journeys,
+  provider = "local",
+  fallbackFromCloud = false,
+  candidates = [],
+  fullReviewAt = null,
+  fullReviewJourneys = null
+) {
+  const serializedJourneys = serializeContinueJourneysData(journeys);
+  const serializedFullReviewJourneys = Array.isArray(fullReviewJourneys)
+    ? serializeContinueJourneysData(fullReviewJourneys)
+    : provider === "cloud"
+      ? serializedJourneys
+      : null;
   return {
+    incrementalCacheVersion: INCREMENTAL_CACHE_VERSION,
     fingerprint,
     provider,
     fallbackFromCloud,
+    fullReviewAt: Number(fullReviewAt || 0) || null,
+    candidateSnapshot: candidates.map((item) => ({
+      url: item.url,
+      visitCount: item.visitCount,
+      activeDays: item.visitDays.length,
+      lastVisitTime: item.lastVisitTime
+    })),
     createdAt: Date.now(),
-    journeys: journeys.map((journey) => ({
-      label: journey.label,
-      urls: journey.items.map((item) => item.url)
-    }))
+    journeys: serializedJourneys,
+    fullReviewJourneys: serializedFullReviewJourneys
   };
 }
 
-function renderContinueJourneyCards(journeys, provider = "local") {
+function serializeContinueJourneysData(journeys) {
+  return journeys.map((journey) => ({
+      label: journey.label,
+      urls: journey.items.map((item) => item.url)
+    }));
+}
+
+function hydrateContinueJourneysLoose(cache, candidates) {
+  if (
+    !cache ||
+    cache.incrementalCacheVersion !== INCREMENTAL_CACHE_VERSION ||
+    !Array.isArray(cache.journeys)
+  ) return [];
+  const ttl = cache.fallbackFromCloud ? CLOUD_FALLBACK_CACHE_TTL : INCREMENTAL_BASELINE_TTL;
+  if (Date.now() - Number(cache.createdAt || 0) > ttl) return [];
+  return hydrateContinueJourneys(
+    { ...cache, fingerprint: "incremental", createdAt: Date.now(), fallbackFromCloud: false },
+    "incremental",
+    candidates
+  );
+}
+
+function hydrateContinueIncrementalJourneys(cache, candidates) {
+  const currentJourneys = hydrateContinueJourneysLoose(cache, candidates);
+  const fullReviewJourneys = hydrateContinueJourneysData(cache?.fullReviewJourneys, candidates);
+  return mergeContinueJourneyPatch(fullReviewJourneys, currentJourneys);
+}
+
+async function updateContinueJourneysIncrementally(cache, candidates, fingerprint) {
+  const fullReviewJourneys = hydrateContinueJourneysData(cache?.fullReviewJourneys, candidates);
+  const existingJourneys = hydrateContinueIncrementalJourneys(cache, candidates);
+  if (!existingJourneys.length) return null;
+  const baseline = new Map(
+    (Array.isArray(cache.candidateSnapshot) ? cache.candidateSnapshot : [])
+      .map((item) => [journeyUrlKey(item.url), item])
+  );
+  const changedCandidates = candidates.filter((item) => {
+    const previous = baseline.get(journeyUrlKey(item.url));
+    return !previous ||
+      item.visitCount > Number(previous.visitCount || 0) ||
+      item.visitDays.length > Number(previous.activeDays || 0) ||
+      item.lastVisitTime > Number(previous.lastVisitTime || 0);
+  });
+  if (!changedCandidates.length) {
+    return {
+      journeys: existingJourneys,
+      provider: cache.provider || "cloud",
+      fullReviewAt: cache.fullReviewAt || cache.createdAt
+    };
+  }
+
+  const result = await runRateLimitedAiTask({
+    feature: "continue-incremental",
+    fingerprint,
+    loadCached: async () => {
+      const latest = await getStorageValue(CONTINUE_JOURNEY_CACHE_KEY, null);
+      const journeys = hydrateContinueJourneys(latest, fingerprint, candidates);
+      return journeys.length
+        ? { status: "success", journeys, provider: latest.provider || "hybrid", fullReviewAt: latest.fullReviewAt }
+        : null;
+    },
+    saveSuccess: (success) => setStorageValue(
+      CONTINUE_JOURNEY_CACHE_KEY,
+      serializeContinueJourneys(
+        fingerprint,
+        success.journeys,
+        "hybrid",
+        false,
+        candidates,
+        cache.fullReviewAt || cache.createdAt,
+        fullReviewJourneys.length ? fullReviewJourneys : existingJourneys
+      )
+    ),
+    task: async () => {
+      const sessionResult = await getBrowserOrganizerSession({ allowDownload: false });
+      if (sessionResult.status !== "success") return { status: sessionResult.status, journeys: [] };
+      setContinueLoadingMessage(
+        `On-device AI is reviewing ${changedCandidates.length} new or changed page${changedCandidates.length === 1 ? "" : "s"}…`
+      );
+      const patchJourneys = await runBrowserOrganizerPrompt(
+        sessionResult.session,
+        (session) => patchContinueJourneysWithGemini(session, existingJourneys, changedCandidates, candidates)
+      );
+      const journeys = mergeContinueJourneyPatch(existingJourneys, patchJourneys);
+      return {
+        status: journeys.length ? "success" : "empty",
+        journeys,
+        provider: "hybrid",
+        fullReviewAt: cache.fullReviewAt || cache.createdAt
+      };
+    }
+  });
+
+  if (result.status === "success" && result.journeys.length) return result;
+  return {
+    journeys: existingJourneys,
+    provider: cache.provider || "cloud",
+    fullReviewAt: cache.fullReviewAt || cache.createdAt
+  };
+}
+
+function mergeContinueJourneyPatch(existingJourneys, patchJourneys) {
+  const existing = Array.isArray(existingJourneys) ? existingJourneys : [];
+  const patches = Array.isArray(patchJourneys) ? patchJourneys.filter((journey) => journey.items?.length >= 2) : [];
+  if (!existing.length) return patches.slice(0, 3);
+  if (!patches.length) return existing.slice(0, 3);
+
+  const usedPatches = new Set();
+  const merged = existing.map((journey) => {
+    const existingUrls = new Set(journey.items.map((item) => journeyUrlKey(item.url)));
+    const patchIndex = patches.findIndex((patch, index) => {
+      if (usedPatches.has(index)) return false;
+      if (normalizeRecallText(patch.label) === normalizeRecallText(journey.label)) return true;
+      return patch.items.some((item) => existingUrls.has(journeyUrlKey(item.url)));
+    });
+    if (patchIndex < 0) return journey;
+    usedPatches.add(patchIndex);
+    return patches[patchIndex];
+  });
+
+  patches.forEach((patch, index) => {
+    if (usedPatches.has(index)) return;
+    if (merged.length < 3) merged.push(patch);
+    else merged[merged.length - 1] = patch;
+  });
+
+  const seen = new Set();
+  return merged
+    .map((journey) => ({
+      ...journey,
+      items: journey.items.filter((item) => {
+        const url = journeyUrlKey(item.url);
+        if (!url || seen.has(url)) return false;
+        seen.add(url);
+        return true;
+      }).slice(0, 4)
+    }))
+    .filter((journey) => journey.items.length >= 2)
+    .slice(0, 3);
+}
+
+function renderContinueJourneyCards(journeys, provider = "local", fullReviewAt = null) {
   const section = document.querySelector("#continue-section");
   const list = document.querySelector("#continue-list");
   const subtitle = document.querySelector("#continue-subtitle");
@@ -2923,10 +3855,19 @@ function renderContinueJourneyCards(journeys, provider = "local") {
   const currentTheme = normalizeThemeName(document.documentElement.dataset.themeName || "classic");
   const activePalette = themePalettes[currentTheme] || themePalettes.classic;
   section.classList.remove("is-ai-working");
+  section.classList.remove("is-ai-updating");
   section.setAttribute("aria-busy", "false");
-  subtitle.textContent = "Ongoing journeys from your recent activity";
-  badgeLabel.textContent = provider === "cloud" ? "Grouped by Gemini Flash" : "Grouped on-device";
+  setContinueRefreshBusy(false);
+  subtitle.textContent = fullReviewAt
+    ? `Ongoing journeys · full Flash review ${relativeTime(fullReviewAt).toLocaleLowerCase()}`
+    : "Ongoing journeys from your recent activity";
+  badgeLabel.textContent = provider === "cloud"
+    ? "Full review by Gemini Flash"
+    : provider === "hybrid"
+      ? "Updated locally"
+      : "Grouped on-device";
   clearChildren(list);
+  const fragment = document.createDocumentFragment();
 
   journeys.forEach((journey, index) => {
     const colors = activePalette[index % activePalette.length];
@@ -3042,8 +3983,9 @@ function renderContinueJourneyCards(journeys, provider = "local") {
     footer.append(resumeBtn);
 
     card.append(header, heading, pagesList, footer);
-    list.append(card);
+    fragment.append(card);
   });
+  list.append(fragment);
 
   section.hidden = false;
 }
@@ -3089,6 +4031,7 @@ function dayKeyForTimestamp(timestamp) {
 }
 
 function renderEmptyPills(container) {
+  const fragment = document.createDocumentFragment();
   for (let index = 0; index < 3; index += 1) {
     const pill = document.createElement("div");
     pill.className = "recent-pill recent-pill-empty";
@@ -3102,17 +4045,20 @@ function renderEmptyPills(container) {
     line2.className = "recent-pill-skeleton-line short";
     content.append(line1, line2);
     pill.append(icon, content);
-    container.append(pill);
+    fragment.append(pill);
   }
+  container.append(fragment);
 }
 
 function renderEmptyTiles(container) {
+  const fragment = document.createDocumentFragment();
   for (let index = 0; index < 8; index += 1) {
     const tile = document.createElement("span");
     tile.className = "favorite-item favorite-item-empty";
     tile.append(document.createElement("span"), document.createElement("span"));
-    container.append(tile);
+    fragment.append(tile);
   }
+  container.append(fragment);
 }
 
 function renderMessage(container, message) {
@@ -3124,9 +4070,7 @@ function renderMessage(container, message) {
 }
 
 function clearChildren(element) {
-  while (element.firstChild) {
-    element.firstChild.remove();
-  }
+  element.replaceChildren();
 }
 
 function debounce(fn, delay) {
@@ -3262,7 +4206,7 @@ function loadIconSources(img, pageUrl, size, onFailure) {
 
 async function loadIconSourcesAsync(img, pageUrl, size, onFailure) {
   const host = hostnameFor(pageUrl);
-  const cached = await getCachedIcon(host);
+  const cached = await getCachedIcon(host, size);
 
   img.referrerPolicy = "no-referrer";
 
@@ -3273,6 +4217,21 @@ async function loadIconSourcesAsync(img, pageUrl, size, onFailure) {
       await clearCachedIconForHost(host);
       await probeAndApplyIconSources(img, pageUrl, size, onFailure);
     }, { once: true });
+    return;
+  }
+
+  if (IS_EXTENSION_CONTEXT) {
+    const localSource = chromeFaviconUrl(pageUrl, size);
+    img.addEventListener("load", () => {
+      const lowResolution = !isVectorIconUrl(localSource) &&
+        (img.naturalWidth < 64 || img.naturalHeight < 64);
+      img.classList.toggle("is-low-res", lowResolution);
+      void setCachedIconForUrl(pageUrl, localSource, lowResolution, size);
+    }, { once: true });
+    img.addEventListener("error", () => {
+      void probeAndApplyIconSources(img, pageUrl, size, onFailure);
+    }, { once: true });
+    img.src = localSource;
     return;
   }
 
@@ -3295,7 +4254,7 @@ async function probeAndApplyIconSources(img, pageUrl, size, onFailure) {
   const useSource = (source, lowResolution) => {
     img.classList.toggle("is-low-res", lowResolution);
     img.src = source;
-    void setCachedIconForUrl(pageUrl, source, lowResolution);
+    void setCachedIconForUrl(pageUrl, source, lowResolution, size);
   };
 
   const tryNext = () => {
@@ -3425,7 +4384,7 @@ function chromeFaviconUrl(pageUrl, size) {
   return url.toString();
 }
 
-async function getCachedIcon(host) {
+async function getCachedIcon(host, requestedSize = 0) {
   if (!host) return null;
 
   const cache = await getIconCache();
@@ -3437,6 +4396,9 @@ async function getCachedIcon(host) {
     await saveIconCache(cache);
     return null;
   }
+  if (!isVectorIconUrl(entry.source) && Number(entry.size || 0) < Math.min(Number(requestedSize || 0), 128)) {
+    return null;
+  }
 
   return {
     source: entry.source,
@@ -3444,7 +4406,7 @@ async function getCachedIcon(host) {
   };
 }
 
-async function setCachedIconForUrl(pageUrl, source, lowResolution) {
+async function setCachedIconForUrl(pageUrl, source, lowResolution, size = 0) {
   const host = hostnameFor(pageUrl);
   if (!host || !source) return;
 
@@ -3452,6 +4414,7 @@ async function setCachedIconForUrl(pageUrl, source, lowResolution) {
   cache.entries[host] = {
     source,
     lowResolution: Boolean(lowResolution),
+    size: Math.max(0, Number(size || 0)),
     updatedAt: Date.now()
   };
   await saveIconCache(cache);
@@ -3468,7 +4431,7 @@ async function clearCachedIconForHost(host) {
   if (!cache.entries[host]) return;
 
   delete cache.entries[host];
-  await saveIconCache(cache);
+  await saveIconCache(cache, { immediate: true });
 }
 
 async function getIconCache() {
@@ -3498,6 +4461,7 @@ function normalizeIconCache(value) {
     freshEntries[host] = {
       source: entry.source,
       lowResolution: Boolean(entry.lowResolution),
+      size: Math.max(0, Number(entry.size || 0)),
       updatedAt: Number(entry.updatedAt || now)
     };
   });
@@ -3508,9 +4472,29 @@ function normalizeIconCache(value) {
   };
 }
 
-async function saveIconCache(cache) {
-  iconCache = normalizeIconCache(cache);
-  await setStorageValue(ICON_CACHE_KEY, iconCache);
+function saveIconCache(cache, { immediate = false } = {}) {
+  iconCache = cache === iconCache ? cache : normalizeIconCache(cache);
+  iconCacheDirty = true;
+  window.clearTimeout(iconCacheWriteTimeout);
+  iconCacheWriteTimeout = 0;
+  if (immediate) return flushIconCacheWrites();
+  iconCacheWriteTimeout = window.setTimeout(() => {
+    iconCacheWriteTimeout = 0;
+    void flushIconCacheWrites();
+  }, ICON_CACHE_WRITE_DELAY);
+  return Promise.resolve();
+}
+
+function flushIconCacheWrites() {
+  window.clearTimeout(iconCacheWriteTimeout);
+  iconCacheWriteTimeout = 0;
+  if (!iconCache || !iconCacheDirty) return iconCacheWritePromise;
+  const snapshot = normalizeIconCache(iconCache);
+  iconCacheDirty = false;
+  iconCacheWritePromise = iconCacheWritePromise
+    .catch(() => {})
+    .then(() => setStorageValue(ICON_CACHE_KEY, snapshot));
+  return iconCacheWritePromise;
 }
 
 function callChrome(fn, ...args) {
@@ -3533,19 +4517,47 @@ function callChrome(fn, ...args) {
   });
 }
 
+function setupStorageCacheInvalidation() {
+  if (!IS_EXTENSION_CONTEXT || !chrome.storage?.onChanged) return;
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") return;
+    Object.entries(changes).forEach(([key, change]) => {
+      storageReadPromises.delete(key);
+      if (typeof change.newValue === "undefined") storageValueCache.delete(key);
+      else storageValueCache.set(key, change.newValue);
+
+      if (key === CLOUD_AI_CONFIG_KEY) {
+        volatileCloudAiConfig = change.newValue ?? null;
+        cloudAiConfigCacheLoaded = true;
+        cloudAiConfigReadPromise = null;
+      }
+    });
+  });
+}
+
 function getStorageValue(key, fallback) {
+  if (storageValueCache.has(key)) return Promise.resolve(storageValueCache.get(key));
+  if (storageReadPromises.has(key)) return storageReadPromises.get(key);
+
   if (!IS_EXTENSION_CONTEXT) {
     const stored = localStorage.getItem(key);
-    if (stored === null) return Promise.resolve(fallback);
+    if (stored === null) {
+      storageValueCache.set(key, fallback);
+      return Promise.resolve(fallback);
+    }
 
     try {
-      return Promise.resolve(JSON.parse(stored));
+      const value = JSON.parse(stored);
+      storageValueCache.set(key, value);
+      return Promise.resolve(value);
     } catch {
-      return Promise.resolve(stored || fallback);
+      const value = stored || fallback;
+      storageValueCache.set(key, value);
+      return Promise.resolve(value);
     }
   }
 
-  return new Promise((resolve) => {
+  const read = new Promise((resolve) => {
     chrome.storage.local.get({ [key]: fallback }, (items) => {
       const error = chrome.runtime.lastError;
       if (error) {
@@ -3553,27 +4565,39 @@ function getStorageValue(key, fallback) {
         resolve(fallback);
         return;
       }
+      storageValueCache.set(key, items[key]);
       resolve(items[key]);
     });
+  }).finally(() => {
+    storageReadPromises.delete(key);
   });
+  storageReadPromises.set(key, read);
+  return read;
 }
 
 function setStorageValue(key, value) {
   if (!IS_EXTENSION_CONTEXT) {
     if (value === null || typeof value === "undefined") {
       localStorage.removeItem(key);
+      storageValueCache.delete(key);
       return Promise.resolve();
     }
 
     localStorage.setItem(key, JSON.stringify(value));
+    storageValueCache.set(key, value);
     return Promise.resolve();
   }
 
+  const hadCachedValue = storageValueCache.has(key);
+  const previousCachedValue = storageValueCache.get(key);
+  storageValueCache.set(key, value);
   return new Promise((resolve) => {
     chrome.storage.local.set({ [key]: value }, () => {
       const error = chrome.runtime.lastError;
       if (error) {
         console.warn(error);
+        if (hadCachedValue) storageValueCache.set(key, previousCachedValue);
+        else storageValueCache.delete(key);
       }
       resolve();
     });
@@ -3606,31 +4630,46 @@ function ensureTrustedLocalStorageAccess() {
 }
 
 async function getCloudAiConfigValue() {
-  if (!IS_EXTENSION_CONTEXT) return volatileCloudAiConfig;
-
-  try {
-    await ensureTrustedLocalStorageAccess();
-  } catch (error) {
-    console.warn("Unable to restrict Gemini key storage to trusted extension contexts", error.message);
-    return null;
+  if (cloudAiConfigCacheLoaded) return volatileCloudAiConfig;
+  if (cloudAiConfigReadPromise) return cloudAiConfigReadPromise;
+  if (!IS_EXTENSION_CONTEXT) {
+    cloudAiConfigCacheLoaded = true;
+    return volatileCloudAiConfig;
   }
 
-  return new Promise((resolve) => {
-    chrome.storage.local.get({ [CLOUD_AI_CONFIG_KEY]: null }, (items) => {
-      const error = chrome.runtime.lastError;
-      if (error) {
-        console.warn("Unable to read device-local Gemini settings", error.message);
-        resolve(null);
-        return;
-      }
-      resolve(items[CLOUD_AI_CONFIG_KEY]);
+  cloudAiConfigReadPromise = (async () => {
+    try {
+      await ensureTrustedLocalStorageAccess();
+    } catch (error) {
+      console.warn("Unable to restrict Gemini key storage to trusted extension contexts", error.message);
+      return null;
+    }
+
+    return new Promise((resolve) => {
+      chrome.storage.local.get({ [CLOUD_AI_CONFIG_KEY]: null }, (items) => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          console.warn("Unable to read device-local Gemini settings", error.message);
+          resolve(null);
+          return;
+        }
+        resolve(items[CLOUD_AI_CONFIG_KEY]);
+      });
     });
+  })().then((value) => {
+    volatileCloudAiConfig = value;
+    cloudAiConfigCacheLoaded = true;
+    return value;
+  }).finally(() => {
+    cloudAiConfigReadPromise = null;
   });
+  return cloudAiConfigReadPromise;
 }
 
 async function setCloudAiConfigValue(value) {
   if (!IS_EXTENSION_CONTEXT) {
     volatileCloudAiConfig = value;
+    cloudAiConfigCacheLoaded = true;
     return;
   }
 
@@ -3651,7 +4690,48 @@ async function setCloudAiConfigValue(value) {
         reject(storageError);
         return;
       }
+      volatileCloudAiConfig = value;
+      cloudAiConfigCacheLoaded = true;
+      storageValueCache.delete(CLOUD_AI_CONFIG_KEY);
       resolve();
+    });
+  });
+}
+
+function getSessionStorageValue(key, fallback) {
+  if (!IS_EXTENSION_CONTEXT || !chrome.storage.session) {
+    return Promise.resolve(volatileSessionStorage.has(key) ? volatileSessionStorage.get(key) : fallback);
+  }
+
+  return new Promise((resolve) => {
+    chrome.storage.session.get({ [key]: fallback }, (items) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        console.warn("Unable to read session AI refresh state", error.message);
+        resolve(fallback);
+        return;
+      }
+      resolve(items[key]);
+    });
+  });
+}
+
+function setSessionStorageValue(key, value) {
+  if (!IS_EXTENSION_CONTEXT || !chrome.storage.session) {
+    if (value === null || typeof value === "undefined") volatileSessionStorage.delete(key);
+    else volatileSessionStorage.set(key, value);
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    chrome.storage.session.set({ [key]: value }, () => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        console.warn("Unable to update session AI refresh state", error.message);
+        resolve(false);
+        return;
+      }
+      resolve(true);
     });
   });
 }

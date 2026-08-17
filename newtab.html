@@ -72,13 +72,20 @@
             <p class="recent-mode-note" id="recent-mode-note" role="status" aria-live="polite" hidden></p>
           </div>
           <div class="recent-actions">
-            <button class="recent-organize-button" id="recent-organize" type="button" aria-pressed="false" title="Group and rank recently closed tabs with AI">
+            <button class="ai-refresh-button" id="recent-ai-refresh" type="button" aria-label="Refresh AI for recently closed tabs" title="Run a fresh AI review of recently closed tabs">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <path d="M20 11a8 8 0 1 0-2.34 5.66"></path>
+                <path d="M20 4v7h-7"></path>
+              </svg>
+              <span>Refresh AI</span>
+            </button>
+            <button class="recent-organize-button" id="recent-organize" type="button" aria-label="Organize recently closed tabs with AI" aria-pressed="false" title="Group and rank recently closed tabs with AI">
               <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
                 <path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path>
               </svg>
               <span>Organize</span>
             </button>
-            <button class="clear-button" id="clear-recent" type="button">Clear All</button>
+            <button class="clear-button" id="clear-recent" type="button" aria-label="Clear recently closed tabs" title="Clear recently closed tabs">Clear All</button>
           </div>
         </div>
         <div class="recent-grid" id="recent-list" aria-busy="false"></div>
@@ -90,12 +97,21 @@
             <h2 id="continue-heading">Continue</h2>
             <p id="continue-subtitle" role="status" aria-live="polite">Ongoing journeys from your recent activity</p>
           </div>
-          <span class="continue-private-badge">
-            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-              <path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path>
-            </svg>
-            <span id="continue-badge-label">Grouped on-device</span>
-          </span>
+          <div class="continue-heading-actions">
+            <button class="ai-refresh-button" id="continue-ai-refresh" type="button" aria-label="Refresh AI for Continue" title="Run a fresh AI review of recent activity">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <path d="M20 11a8 8 0 1 0-2.34 5.66"></path>
+                <path d="M20 4v7h-7"></path>
+              </svg>
+              <span>Refresh AI</span>
+            </button>
+            <span class="continue-private-badge" title="AI result source">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <path d="M12 3c.7 5 4 8.3 9 9-5 .7-8.3 4-9 9-.7-5-4-8.3-9-9 5-.7 8.3-4 9-9Z"></path>
+              </svg>
+              <span id="continue-badge-label">Grouped on-device</span>
+            </span>
+          </div>
         </div>
         <div class="journeys-grid" id="continue-list"></div>
       </section>
@@ -125,13 +141,13 @@
             </button>
             <button class="ai-provider-option" type="button" data-ai-provider="cloud" aria-pressed="false">
               <span>Gemini Flash</span>
-              <small>Faster · stronger</small>
+              <small>Full review · local updates</small>
             </button>
           </div>
           <div class="cloud-ai-setup" id="cloud-ai-setup" hidden>
             <div class="cloud-ai-disclosure">
               <strong>Before you enable cloud AI</strong>
-              <p>Eligible tab titles, domains, URL paths, timing, and visit counts for Recent and Continue will be sent directly from Chrome to Google Gemini. Safarian never receives them.</p>
+              <p>Eligible tab titles, domains, URL paths, timing, and visit counts for Recent and Continue will be sent directly from Chrome to Google Gemini. Safarian never receives them. Each feature makes one automatic full Flash review per Chrome session; later changes are evaluated on-device.</p>
             </div>
             <label class="cloud-ai-key-field">
               <span>Gemini API key</span>

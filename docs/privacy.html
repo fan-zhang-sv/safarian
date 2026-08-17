@@ -45,22 +45,31 @@
           By default, when Chrome's on-device model is already available, Smart Recent Tabs automatically provides titles,
           domains, close times, and limited window-tab titles from up to 18 eligible recoverable web sessions to that
           model when a new tab opens. Safarian never starts a model download for this automatic action. Gemini
-          returns only references to those real sessions. Fingerprinted group labels and session identifiers are cached locally
-          for six hours so unchanged sessions are not repeatedly processed. You can return to chronological order
+          returns only references to those real sessions. Fingerprinted group labels and a baseline of eligible session
+          identifiers are cached locally so unchanged sessions are not repeatedly processed and warm-session updates can
+          evaluate only new tabs. You can return to chronological order
           at any time.
         </p>
         <p>
           By default, when the on-device model is already available, Continue examines activity from the last 30 days that
           occurred across multiple days, excluding exact Favorite and Recently Closed URLs. Safarian provides
           eligible page titles, domains, URL paths, visit counts, active-day counts, and recency to the local model.
-          Gemini can only group references to those real pages. Fingerprinted journey labels and page URLs are cached locally for
-          12 hours. Small local attempt records apply cooldowns after empty results, unavailable-model states, or failures
-          so unchanged activity is not repeatedly processed. If there is no strong multi-page journey, the section remains hidden.
+          Gemini can only group references to those real pages. Fingerprinted journey labels, page URLs, and a local baseline
+          of eligible URL activity counts are cached so warm-session updates can evaluate only new or changed activity. Small
+          local attempt records apply cooldowns after empty results, unavailable-model states, or failures so unchanged
+          activity is not repeatedly processed. If there is no strong multi-page journey, the section explains that it is
+          waiting for a stronger signal.
         </p>
         <p>
           You may explicitly opt in to Gemini Flash for Smart Recent Tabs and Continue by supplying your own Gemini
           API key and accepting an in-product disclosure. In that mode, the same eligible metadata described above is
-          sent directly by your browser to Google's Gemini API for grouping. Safarian requests that Google not store
+          sent directly by your browser to Google's Gemini API for grouping. Each feature makes at most one automatic
+          full Flash review per Chrome session, subject to a persistent 30-minute minimum interval that prevents rapid
+          extension reloads from creating repeated reviews. Safarian records that non-sensitive refresh claim in Chrome's
+          in-memory session storage, preserves an immutable local snapshot of the full-review groups, compares later activity
+          with the cached baseline, and asks Gemini Nano to patch only new or changed items when Nano is already available.
+          Nano patches are merged into that snapshot so omitted groups are preserved. Warm-session changes do not automatically trigger another cloud
+          request. A deliberate Refresh AI action can request a new full review for either feature. Safarian requests that Google not store
           each interaction. If a cloud request fails, Safarian falls back to Gemini Nano when it is available. Cloud
           and on-device results use provider-aware local caches; a fallback result is cached for one hour to avoid
           repeated failed cloud requests.
