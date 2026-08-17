@@ -60,5 +60,7 @@ Replace Chrome's new tab page with a personal dashboard for bookmarks, session r
 
 - Store icon: `assets/icons/icon-128.png`
 - Small promo tile: `store-assets/safarian-promo-440x280.png`
-- Screenshot: `store-assets/safarian-screenshot-1280x800.png`
+- Classic screenshot: `store-assets/safarian-theme-classic-1280x800.png`
+- Emerald screenshot: `store-assets/safarian-theme-emerald-1280x800.png`
+- Twilight Dark screenshot: `store-assets/safarian-theme-twilight-dark-1280x800.png`
 - Backup screenshot: `store-assets/safarian-screenshot-640x400.png`

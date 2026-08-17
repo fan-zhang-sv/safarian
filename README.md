@@ -20,6 +20,14 @@ Run:
 
 The script validates the manifest and JavaScript, checks required icon and listing asset sizes, and writes a minimal Chrome Web Store zip to `dist/`.
 
+Refresh the deterministic multi-theme marketing screenshots with:
+
+```sh
+node scripts/capture-marketing-screenshots.mjs
+```
+
+The capture uses simulated browsing data to show Safarian's real Smart Recent Tabs and Continue interfaces without exposing personal browsing history.
+
 ## Privacy Policy Website
 
 The Chrome Web Store privacy policy site lives in `docs/` and is deployed to GitHub Pages by `.github/workflows/deploy-pages.yml` when changes are pushed to `main` or `master`.
